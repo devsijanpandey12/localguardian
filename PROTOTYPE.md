@@ -1,84 +1,59 @@
-# LocalGuardian Prototype — What Was Built & Why Each Choice Was Made
+# LocalGuardian Prototype (v0.2.0) — What Was Built & Why Each Choice Was Made
 
-> **Scope:** Unlike [RESEARCH.md](./RESEARCH.md) (broader SOTA landscape & future roadmap) and [FLOWCHART_RESEARCH.md](./FLOWCHART_RESEARCH.md) (full target flowcharts), this document records **strictly what is implemented right now in Prototype v0.1**, the exact libraries and models used, and the engineering rationale behind every choice.
+> **Scope:** Unlike [RESEARCH.md](./RESEARCH.md) (broader SOTA landscape & roadmap), this document records **strictly what is implemented and verified right now in v0.2.0**, the exact libraries and local models used, and the engineering rationale behind every choice.
 
 ---
 
-## 1. Prototype Runtime Environment
+## 1. Runtime Environment & Launchers
 
 | Component | What We Used | Why We Chose It |
 | :--- | :--- | :--- |
-| **Python Environment** | Dedicated Anaconda env `localguardian` (`Python 3.11.18`) | Isolates Windows COM/audio (`pycaw`, `pywin32`), Playwright, and Whisper dependencies cleanly without touching the base Anaconda install. Python 3.11 has universal prebuilt Windows wheels for every package in our stack. |
-| **Packaging** | `pyproject.toml` (`setuptools`, `src/` layout) + `environment.yml` | Standard open-source Python packaging so `pip install -e .` installs the `localguardian` CLI command directly and prevents accidental relative-import bugs. |
-| **Configuration** | `PyYAML` + `Pydantic v2` (`src/localguardian/config.py`, `config/default_config.yaml`) | Gives human-readable YAML defaults (`browser.priority: chrome`, `llm.model: qwen3:4b`, `voice.stt_device: cpu`) with strict type validation at startup. |
+| **Python Environment** | Dedicated Anaconda env `localguardian` (`Python 3.11.18`) | Isolates Windows COM/audio (`pycaw`, `pywin32`), `cactus-compute`, Playwright, and `faster-whisper` cleanly without touching base Anaconda. |
+| **Packaging** | `pyproject.toml` (`setuptools`, `src/` layout) + `environment.yml` + `run.ps1` | Standard Python package install (`localguardian` CLI) plus a zero-setup PowerShell launcher (`.\run.ps1`) so regular PowerShell works even when `conda` is not on `PATH`. |
+| **Configuration** | `PyYAML` + `Pydantic v2` (`config/default_config.yaml`, `src/localguardian/config.py`) | Strongly typed configuration for all 3 cascade tiers, Chrome #1 priority, Needle confidence threshold, and allowlisted apps. |
 
 ---
 
 ## 2. Hard Safety Core (`src/localguardian/safety/`)
 
-The safety core was built **first**, before any tool execution code, as an independent layer outside the LLM.
+Built **first** as a deterministic Python wall completely independent of both Cactus Needle and Qwen3.
 
 | File | What Was Built | Why We Designed It This Way |
 | :--- | :--- | :--- |
-| `safety/policy.py` | Immutable `SafetyPolicy` engine with hard-coded denylists (`C:\Windows`, `C:\Program Files`, `C:\Program Files (x86)`, `C:\ProgramData`, `%APPDATA%`, `%LOCALAPPDATA%`, Registry hives, `.ssh`/`.env`/`.pem`/`.key`, `~/.localguardian`), forbidden shell/binary blocklists (`run_powershell`, `cmd.exe`, `regedit`, `diskpart`), executable write block (`.exe`, `.ps1`, `.bat`, `.reg`, etc.), strict URL validator (`http`/`https` only), hotkey blacklist (`Win`, `Alt+F4`, `Ctrl+Alt+Del`), and 4-tier risk classification (`SAFE`, `MEDIUM`, `HIGH`, `FORBIDDEN`). | **Never trust LLM system prompts for security.** Small local models can hallucinate or suffer prompt injection from web content. Hard-coding protected Windows directories and canonicalizing paths via `Path.resolve(strict=False)` defeats `..\..\Windows` traversal and guarantees system/program files can never be corrupted—even if someone misconfigures YAML. |
-| `safety/confirm.py` | `ConfirmationManager` supporting desktop Tkinter Yes/No modal (`DIALOG`), terminal prompt (`CLI`), and fail-closed `DENY` mode. | Any `MEDIUM`/`HIGH` risk action requires explicit human sign-off; using built-in `tkinter` avoids heavy GUI framework overhead in v0.1. |
-| `safety/audit.py` | Local SQLite append-only log (`~/.localguardian/audit.db`) via Python's built-in `sqlite3`. | Zero external database setup; lets you inspect every spoken command, routing tier, policy rule ID, and blocked attempt (`localguardian --audit`). |
-| `safety/failsafe.py` | Thread-safe `FailsafeController` with manual abort flag and Win32 `GetCursorPos` top-left corner-slam check. | Provides an instant physical human override independent of the LLM loop. |
+| `safety/policy.py` | Immutable `SafetyPolicy` with hard-coded denylists (`C:\Windows`, `C:\Program Files`, `C:\Program Files (x86)`, `C:\ProgramData`, `%APPDATA%`, `%LOCALAPPDATA%`, Registry hives, `.ssh`/`.env`/`.pem`/`.key`, `~/.localguardian`), forbidden shell/binary blocklists (`run_powershell`, `cmd.exe`, `regedit`, `diskpart`), executable write blocks, strict URL scheme validation (`http`/`https` only), screenshot filename traversal blocking, media/snap/mode enum enforcement, hotkey blacklist (`Win`, `Alt+F4`, `Ctrl+Alt+Del`), and 4-level risk tiers. | **Never trust LLM or edge-model prompts for security.** Even if Cactus Needle or Qwen3 gets confused or sees prompt-injected text in Chrome, `SafetyPolicy.evaluate()` runs in deterministic Python before any OS/file API executes. |
+| `safety/confirm.py` | `ConfirmationManager` (`Tkinter` desktop modal, CLI prompt, fail-closed `DENY`). | Explicit human approval for `MEDIUM`/`HIGH` actions with zero extra GUI dependencies. |
+| `safety/audit.py` | Local SQLite audit log (`~/.localguardian/audit.db`) via built-in `sqlite3`. | Records every transcript, routing tier (`tier1_grammar`, `tier1_5_cactus_needle`, `tier2_ollama`, `mcp`), tool call, policy rule ID, and outcome (`.\run.ps1 --audit`). |
+| `safety/failsafe.py` | Thread-safe abort flag + Win32 top-left corner-slam failsafe. | Instant physical human override independent of model execution. |
 
 ---
 
-## 3. Typed Windows OS & Google Chrome Tools (`src/localguardian/tools/`)
+## 3. True 3-Tier Local Cognitive Cascade (`src/localguardian/brain/`)
 
-Instead of giving the model arbitrary PowerShell access, every capability is exposed as a narrow, Pydantic-validated Python function routed through one central chokepoint.
+| Tier & File | Model / Library | Latency & Hardware | Why We Structured the Cascade This Way |
+| :--- | :--- | :--- | :--- |
+| **Tier 1:** `fast_grammar.py` | Pure Python regex grammar | **<1 ms** (CPU, 0 VRAM) | Exact direct commands (*"Windows, increase the brightness"*, *"put chrome on the left"*, *"pause music"*) execute instantly with 100% predictability; explicit unsafe phrases (*"delete C:\Windows"*, *"run powershell"*) route straight to `SafetyPolicy` for audited refusal. |
+| **Tier 1.5:** `needle_router.py` | **`cactus-compute` v4.2.6 (`cactus.Needle`)** (`min_confidence=0.65`, `CACTUS_TELEMETRY=0`) | **~70–130 ms** (CPU, ~131 MB RAM, 0 VRAM) | **Empirical design insight:** Live benchmarking showed Needle 3 excels at compact, grounded single-step tool calls (e.g., `set_volume(40)` at 0.90 conf in 72 ms, `open_app("notepad")` at 0.81 conf in 113 ms, `chrome_search` at 0.75 conf in 128 ms) while dropping to low confidence (0.05–0.43) on ambiguous or multi-step prompts. Giving Needle a compact 6-tool schema + `min_confidence=0.65` gate yields fast CPU routing with clean escalation to Tier 2. |
+| **Tier 2:** `llm_planner.py` | **`httpx` → Ollama `qwen3:4b`** (`Q4_K_M`, GGUF) | **~8–12 s** (RTX 4050 GPU, ~3.0 GB VRAM) | Handles messy multi-step reasoning (*"my eyes hurt, lower brightness a bit and look up SpaceX in Chrome"*) with full access to all 17 safe tools. Includes `<think>` / orphan `</think>` stripping and multi-stage JSON repair. |
+| **Orchestrator:** `orchestrator.py` | `LocalGuardianOrchestrator` | — | Runs `Tier 1 → Tier 1.5 (confidence-gated) → Tier 2`, captures `needle_trace` (confidence, latency, RAM), and stops any multi-step chain immediately on a safety block. |
 
-| File | Libraries Used | Why We Chose Them |
+---
+
+## 4. Typed Windows OS, Window Management & Chrome Tools (`src/localguardian/tools/`)
+
+All 17 tools pass through one mandatory chokepoint (`tools/registry.py`: Failsafe → `SafetyPolicy` → Pydantic Schema → Dry-Run/Confirm → Execute → SQLite Audit).
+
+| File | Tools & Libraries | Why We Chose Them |
 | :--- | :--- | :--- |
-| `tools/registry.py` | `Pydantic v2` + `ToolRegistry` | Single mandatory pipeline: **Failsafe → `SafetyPolicy.evaluate()` → Pydantic schema check → Dry-Run / Confirmation → Execute → Audit Log**. Also auto-exports OpenAI-compatible JSON schemas so Ollama never even sees forbidden tools. |
-| `tools/os_controls.py` | `screen-brightness-control`, `pycaw` + `comtypes`, `pywin32`, `ctypes` Win32 `GetSystemPowerStatus`, `subprocess.Popen(..., shell=False)` | • `screen-brightness-control` talks natively to Windows WMI / DDC-CI without shelling out.<br>• `pycaw` controls Windows Core Audio directly.<br>• Allowlisted app launches strictly use `shell=False` against verified executable paths so command injection is impossible.<br>• `get_system_status` gives a safe, read-only check of brightness, volume, and battery. |
-| `tools/browser.py` | **Playwright (`channel="chrome"`)** with native Chrome fallback | **Google Chrome is locked as Priority #1.** Playwright drives your real installed Chrome via DOM selectors (far faster and more reliable than pixel clicking) and keeps the Chrome session alive during interactive runs so follow-up commands reuse the same window. Edge/Chromium is only touched if Chrome is absent. |
+| `tools/os_controls.py` | • **Brightness:** `screen-brightness-control` (WMI / DDC-CI)<br>• **Audio:** `pycaw` + `comtypes` (Windows Core Audio)<br>• **Media Playback:** Win32 `keybd_event` (`VK_MEDIA_PLAY_PAUSE`, `NEXT`, `PREV`)<br>• **Allowlisted Apps:** `subprocess.Popen(..., shell=False)`<br>• **Sandboxed Screenshots:** `Pillow.ImageGrab` strictly inside `~/LocalGuardian_Workspace/screenshots/`<br>• **Workspace Presets:** `coding`, `study`, `focus`, `relax`<br>• **Read-Only System Diagnostics:** `psutil` (CPU/RAM/top processes) + Win32 battery + read-only `nvidia-smi` GPU temp/VRAM | Narrow, typed native APIs eliminate shell injection entirely while delivering genuinely useful day-to-day desktop control and live hardware health visibility. |
+| `tools/window_tools.py` | `list_open_windows`, `focus_window`, `snap_window` (`left`, `right`, `maximize`, `minimize`) via Win32 `ctypes` (`EnumWindows`, `SystemParametersInfoW` `SPI_GETWORKAREA`, `MoveWindow`) | Uses the real desktop work area (excluding the taskbar) and runs strictly under standard-user UIPI so elevated/UAC windows can never be touched. |
+| `tools/browser.py` | **Playwright (`channel="chrome"`)** + native Chrome launcher fallback | **Google Chrome is Priority #1.** Drives real installed Chrome cleanly via semantic DOM locators; falls back to Edge/Chromium only if Chrome is not installed. |
+| `mcp_server.py` | Official **`mcp` SDK (`MCPServer` on `mcp 2.x`, `FastMCP` v1 fallback)** | Exposes all 17 safety-gated tools over `stdio` (`.\run.ps1 --mcp`) so LM Studio, Claude Desktop, VS Code, or Cursor can reuse LocalGuardian's sandboxed hands directly. |
 
 ---
 
-## 4. Local Cognitive Cascade & MCP (`src/localguardian/brain/`, `mcp_server.py`)
+## 5. Dual Offline CPU Voice Stack (`src/localguardian/voice/`)
 
-| File | Model / Library Used | Why We Chose Them |
+| File | Backends & Libraries | Why We Chose Them |
 | :--- | :--- | :--- |
-| `brain/fast_grammar.py` | Pure Python regex fast-path (`FastGrammarParser`) | Handles common direct commands (*"Windows, increase the brightness"*, *"go to Chrome and type Elon Musk"*, volume, mute, open apps) in **<1 ms on CPU**—zero GPU spin-up and works even when Ollama isn't running. Also catches explicit unsafe phrases (*"delete C:\Windows"*, *"run powershell"*) and routes them into `SafetyPolicy` so you get an explicit, audited block. |
-| `brain/llm_planner.py` | **`httpx` → Ollama (`qwen3:4b`)** on RTX 4050 GPU + custom multi-stage JSON repair | **Why `Qwen3` (`qwen3:4b` default, `qwen3:8b` optional)?** Qwen3 currently leads open-weight small models in structured function calling and strict JSON tool-use accuracy while fitting comfortably inside your **RTX 4050's 6 GB VRAM** (~2.6 GB for `4b` Q4_K_M). The custom parser strips Qwen3's `<think>...</think>` reasoning blocks and repairs minor JSON quirks (markdown fences, trailing commas) so small local models stay reliable. |
-| `brain/orchestrator.py` | `LocalGuardianOrchestrator` | Clean 2-tier cascade: tries Tier-1 fast grammar first, escalates to Tier-2 Ollama only when natural phrasing or multi-step reasoning is needed, and halts immediately if any step hits a safety block. |
-| `mcp_server.py` | Official **`mcp` Python SDK (`MCPServer` on `mcp 2.x`, with `FastMCP` v1 fallback)** over `stdio` | Wraps the exact same `ToolRegistry` with `@mcp.tool()` decorators (~95 lines of code). This makes LocalGuardian's sandboxed Windows & Chrome controls immediately usable by external MCP clients (LM Studio, Claude Desktop, VS Code, Cursor) with zero duplicated safety logic. |
-
----
-
-## 5. Local Voice Pipeline (`src/localguardian/voice/`)
-
-| File | Model / Library Used | Why We Chose Them |
-| :--- | :--- | :--- |
-| `voice/stt.py` | **`faster-whisper` (`base.en`, `device="cpu"`, `compute_type="int8"`)** | Runs 100% offline on your **Ryzen 7 7840HS CPU** (CTranslate2 `int8`, ~250 MB RAM, sub-second transcription). Running STT on CPU keeps **100% of your RTX 4050's 6 GB VRAM dedicated to `qwen3:4b`**. |
-| `voice/listener.py` | **`sounddevice` + `numpy`** (16 kHz mono float32, Push-to-Talk) | Reliable cross-device Windows audio capture without requiring C++ PortAudio compilation headaches (`PyAudio` often fails to build on Windows). Push-to-talk lets you immediately test real voice → Chrome/brightness execution cleanly before adding always-on `openWakeWord` in v0.2. |
-
----
-
-## 6. CLI & Verification (`src/localguardian/cli.py`, `tests/`)
-
-- **`localguardian --doctor`** — One-command diagnostic confirming non-admin privilege, live safety blocks, Chrome installation, OS/browser/voice packages, and Ollama availability.
-- **`localguardian --text [--dry-run]`** — Interactive terminal console for immediate safe testing.
-- **`localguardian --voice [--dry-run]`** — Local microphone voice mode.
-- **`localguardian --once "<cmd>"`** — Single-command execution.
-- **`localguardian --mcp`** — Starts the FastMCP stdio server.
-- **`localguardian --audit`** — Prints recent entries from `~/.localguardian/audit.db`.
-- **Automated Test Suite (`tests/`):**
-  - `tests/test_safety_policy.py` — Adversarial path, traversal, Registry, credential, executable, shell, app, URL scheme, and hotkey block tests.
-  - `tests/test_fast_grammar.py` — Deterministic command parsing and escalation tests.
-  - `tests/test_llm_planner.py` — Qwen3 `<think>` stripping, malformed JSON repair, and native `tool_calls` tests.
-  - `tests/test_orchestrator_e2e.py` — Full cascade + dry-run + adversarial block + SQLite audit tests.
-
----
-
-## 7. Planned Next Additions (Post-Prototype v0.1)
-
-These items from [FLOWCHART_RESEARCH.md](./FLOWCHART_RESEARCH.md) plug directly into the existing modular layers without changing the core architecture:
-1. Hands-free wake word (`openWakeWord` + `Silero VAD`) inside `voice/listener.py`.
-2. Optional `Cactus Needle 3` fast router between `fast_grammar.py` and `llm_planner.py`.
-3. Windows UI Automation (`pywinauto`) for interacting with arbitrary non-Chrome desktop apps + optional vision fallback (`Cactus Mirage` / `OmniParser`).
-4. Minimal always-on-top system tray / floating HUD showing live transcripts, safety verdicts, and one-click undo.
+| `voice/stt.py` | **`faster-whisper`** (`base.en`, CPU `int8`, default) **+ `cactus.Whistle`** (~16.9 MB ultra-light CPU ASR via `--stt whistle`) | Both run **100% on your Ryzen 7 CPU**, keeping all 6 GB of RTX 4050 VRAM free for `qwen3:4b`. `faster-whisper` gives stronger general English accuracy; `Cactus Whistle` gives an ultra-small 16.9 MB footprint. |
+| `voice/listener.py` | `sounddevice` + `numpy` (16 kHz mono float32, Push-to-Talk) | Clean prebuilt Windows wheels (no PortAudio C++ compile pain) and reliable push-to-talk capture verified on your Realtek Microphone Array. |
