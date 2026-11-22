@@ -13,7 +13,7 @@ llm:
   provider: ollama
   base_url: "http://127.0.0.1:11434/v1"
   model: "qwen3:4b"         # Best fast model for RTX 4050 (6 GB VRAM); alternative: qwen3:8b
-  timeout_seconds: 30
+  timeout_seconds: 90
 
 voice:
   stt_backend: faster-whisper

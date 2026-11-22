@@ -28,12 +28,20 @@ Rules:
 """
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_ORPHAN_THINK_RE = re.compile(r"^.*?</think>", re.DOTALL | re.IGNORECASE)
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_thinking(text: str) -> str:
+    cleaned = _THINK_BLOCK_RE.sub("", text)
+    if "</think>" in cleaned.lower():
+        cleaned = _ORPHAN_THINK_RE.sub("", cleaned)
+    return cleaned.strip()
 
 
 def repair_and_parse_json(raw_text: str) -> Optional[Any]:
     """Multi-stage resilient JSON extractor/repairer for small local LLMs."""
-    cleaned = _THINK_BLOCK_RE.sub("", raw_text).strip()
+    cleaned = _strip_thinking(raw_text)
     if not cleaned:
         return None
 
@@ -227,7 +235,7 @@ class LocalLLMPlanner:
 
         message = choices[0].get("message") or {}
         raw_content = str(message.get("content") or "")
-        clean_reply = _THINK_BLOCK_RE.sub("", raw_content).strip()
+        clean_reply = _strip_thinking(raw_content)
 
         # 1. Native structured tool_calls
         native_calls = message.get("tool_calls") or []

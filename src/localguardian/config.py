@@ -26,7 +26,7 @@ class LLMConfig(BaseModel):
     provider: str = "ollama"
     base_url: str = "http://127.0.0.1:11434/v1"
     model: str = "qwen3:4b"
-    timeout_seconds: float = 30.0
+    timeout_seconds: float = 90.0
 
 
 class VoiceConfig(BaseModel):
