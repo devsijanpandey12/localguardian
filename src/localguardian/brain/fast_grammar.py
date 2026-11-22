@@ -201,15 +201,104 @@ class FastGrammarParser:
         if re.match(r"^(?:what(?:'s|\s+is)\s+(?:the\s+)?|check\s+|get\s+)volume$", text, re.IGNORECASE):
             return [PlannedAction(tool_name="get_volume", args={})]
 
-        # 5. Read-only system status / battery
+        # 5. Media playback controls
         if re.match(
-            r"^(?:check|get|show)\s+(?:the\s+)?(?:system\s+status|battery(?:\s+status)?|pc\s+status)$",
+            r"^(?:pause|play|resume|toggle)\s*(?:the\s+)?(?:music|media|song|video|playback)?$",
+            text,
+            re.IGNORECASE,
+        ):
+            return [PlannedAction(tool_name="media_control", args={"action": "play_pause"})]
+        if re.match(
+            r"^(?:next|skip(?:\s+to)?\s+(?:the\s+)?next)\s+(?:track|song|video)$",
+            text,
+            re.IGNORECASE,
+        ):
+            return [PlannedAction(tool_name="media_control", args={"action": "next"})]
+        if re.match(
+            r"^(?:previous|prev|last)\s+(?:track|song|video)$",
+            text,
+            re.IGNORECASE,
+        ):
+            return [PlannedAction(tool_name="media_control", args={"action": "previous"})]
+
+        # 6. Window management (list / focus / snap)
+        if re.match(
+            r"^(?:list|show|what\s+are)\s+(?:the\s+)?(?:open\s+)?windows$",
+            text,
+            re.IGNORECASE,
+        ):
+            return [PlannedAction(tool_name="list_open_windows", args={})]
+
+        m = re.match(
+            r"^(?:snap|put|move)\s+(.+?)\s+(?:(?:to|on)\s+(?:the\s+)?)?(left|right)(?:\s+half|\s+side)?$",
+            text,
+            re.IGNORECASE,
+        )
+        if m:
+            return [
+                PlannedAction(
+                    tool_name="snap_window",
+                    args={"window_name": m.group(1).strip(), "position": m.group(2).lower()},
+                )
+            ]
+
+        m = re.match(r"^(maximize|minimize)\s+(.+)$", text, re.IGNORECASE)
+        if m:
+            return [
+                PlannedAction(
+                    tool_name="snap_window",
+                    args={"window_name": m.group(2).strip(), "position": m.group(1).lower()},
+                )
+            ]
+
+        m = re.match(r"^(?:focus|switch\s+to)\s+(.+?)(?:\s+window)?$", text, re.IGNORECASE)
+        if m:
+            target = m.group(1).strip()
+            mode_match = re.match(r"^(coding|study|focus|relax)\s+mode$", target, re.IGNORECASE)
+            if mode_match:
+                return [
+                    PlannedAction(
+                        tool_name="activate_workspace_mode",
+                        args={"mode": mode_match.group(1).lower()},
+                    )
+                ]
+            return [PlannedAction(tool_name="focus_window", args={"window_name": target})]
+
+        # 7. Workspace modes ("activate study mode", "coding mode")
+        m = re.match(
+            r"^(?:(?:activate|enable|start|enter)\s+)?(coding|study|focus|relax)\s+mode$",
+            text,
+            re.IGNORECASE,
+        )
+        if m:
+            return [
+                PlannedAction(
+                    tool_name="activate_workspace_mode",
+                    args={"mode": m.group(1).lower()},
+                )
+            ]
+
+        # 8. Sandboxed screenshot
+        m = re.match(
+            r"^(?:take\s+(?:a\s+)?screenshot|capture\s+(?:the\s+)?screen)(?:\s+(?:as|named)\s+(.+))?$",
+            text,
+            re.IGNORECASE,
+        )
+        if m:
+            args: Dict[str, Any] = {}
+            if m.group(1):
+                args["filename"] = m.group(1).strip().strip("\"'")
+            return [PlannedAction(tool_name="take_screenshot", args=args)]
+
+        # 9. Read-only system status / battery / GPU / CPU
+        if re.match(
+            r"^(?:check|get|show)\s+(?:the\s+)?(?:system\s+status|battery(?:\s+status)?|pc\s+status|gpu(?:\s+temp(?:erature)?)?|cpu|ram)$",
             text,
             re.IGNORECASE,
         ):
             return [PlannedAction(tool_name="get_system_status", args={})]
 
-        # 6. Open allowlisted apps (e.g. "open chrome", "open notepad", "launch calculator")
+        # 10. Open allowlisted apps (e.g. "open chrome", "open notepad", "launch calculator")
         m = re.match(
             r"^(?:open|launch|start|go\s+to)\s+(?:google\s+)?([a-zA-Z0-9._-]+)$",
             text,

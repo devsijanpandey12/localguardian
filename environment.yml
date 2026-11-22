@@ -5,4 +5,7 @@ dependencies:
   - python=3.11
   - pip
   - pip:
-      - -e .[browser,mcp,dev]
+      - -e .[cactus,browser,mcp,dev]
+      - faster-whisper
+      - sounddevice
+      - numpy

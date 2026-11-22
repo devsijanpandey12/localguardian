@@ -22,6 +22,13 @@ class BrowserConfig(BaseModel):
     default_search_engine: str = "https://www.google.com/search?q={query}"
 
 
+class NeedleConfig(BaseModel):
+    enabled: bool = True
+    min_confidence: float = 0.65
+    max_new_tokens: int = 96
+    disable_telemetry: bool = True
+
+
 class LLMConfig(BaseModel):
     provider: str = "ollama"
     base_url: str = "http://127.0.0.1:11434/v1"
@@ -30,7 +37,7 @@ class LLMConfig(BaseModel):
 
 
 class VoiceConfig(BaseModel):
-    stt_backend: str = "faster-whisper"
+    stt_backend: str = "faster-whisper"  # faster-whisper | cactus-whistle
     stt_model: str = "base.en"
     stt_device: str = "cpu"
     stt_compute_type: str = "int8"
@@ -52,6 +59,7 @@ class SafetyConfig(BaseModel):
 class LocalGuardianConfig(BaseModel):
     profile: str = "balanced"
     browser: BrowserConfig = Field(default_factory=BrowserConfig)
+    needle: NeedleConfig = Field(default_factory=NeedleConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)

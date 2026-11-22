@@ -9,6 +9,12 @@ browser:
   fallback: msedge          # Used only if Google Chrome is not installed
   default_search_engine: "https://www.google.com/search?q={query}"
 
+needle:
+  enabled: true
+  min_confidence: 0.65      # Escalates to Tier-2 Ollama qwen3:4b whenever confidence < 0.65
+  max_new_tokens: 96
+  disable_telemetry: true
+
 llm:
   provider: ollama
   base_url: "http://127.0.0.1:11434/v1"
@@ -16,9 +22,9 @@ llm:
   timeout_seconds: 90
 
 voice:
-  stt_backend: faster-whisper
+  stt_backend: faster-whisper  # faster-whisper | cactus-whistle
   stt_model: "base.en"
-  stt_device: "cpu"         # Keeps 100% of GPU VRAM dedicated to Ollama LLM
+  stt_device: "cpu"            # Keeps 100% of GPU VRAM dedicated to Ollama LLM
   stt_compute_type: "int8"
   wake_word: "hey_jarvis"
 
