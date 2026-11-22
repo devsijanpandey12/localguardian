@@ -106,6 +106,53 @@ def run_doctor(config: LocalGuardianConfig) -> int:
     return 0 if all_safe else 1
 
 
+def run_models_info(config: LocalGuardianConfig) -> int:
+    """Display configured and live local model details (LLM, voice STT, Ollama status)."""
+    import httpx
+
+    print(f"LocalGuardian v{__version__} — Active Models & Runtime")
+    print("=" * 60)
+    print("Tier 1 (Fast Router) : Deterministic Fast Grammar (CPU, <1 ms)")
+    print(f"Tier 2 (Local LLM)   : {config.llm.provider} -> {config.llm.model} ({config.llm.base_url})")
+    print(f"Voice STT            : {config.voice.stt_backend} ({config.voice.stt_model}, device={config.voice.stt_device}, compute={config.voice.stt_compute_type})")
+    print(f"Browser Priority     : {config.browser.priority} (fallback: {config.browser.fallback})")
+
+    planner = LocalLLMPlanner(config)
+    ok, models, msg = planner.health_check()
+    print(f"Ollama Status        : {'ONLINE' if ok else 'OFFLINE'} — {msg}")
+
+    if ok:
+        base = config.llm.base_url.rstrip("/")
+        root = base[:-3] if base.endswith("/v1") else base
+        print(f"Installed Models     : {', '.join(models) if models else '(none pulled yet)'}")
+        try:
+            with httpx.Client(timeout=4.0) as client:
+                show = client.post(f"{root}/api/show", json={"name": config.llm.model})
+                if show.status_code == 200:
+                    details = show.json().get("details") or {}
+                    print(
+                        "Configured Model Info: "
+                        f"family={details.get('family', '?')} | "
+                        f"params={details.get('parameter_size', '?')} | "
+                        f"quant={details.get('quantization_level', '?')} | "
+                        f"format={details.get('format', '?')}"
+                    )
+                ps = client.get(f"{root}/api/ps")
+                if ps.status_code == 200:
+                    running = ps.json().get("models") or []
+                    if running:
+                        for rm in running:
+                            vram_mb = round(rm.get("size_vram", 0) / (1024 * 1024))
+                            total_mb = round(rm.get("size", 0) / (1024 * 1024))
+                            print(f"Loaded in Memory     : {rm.get('name')} ({vram_mb} MB VRAM / {total_mb} MB total)")
+                    else:
+                        print("Loaded in Memory     : (idle — loads onto GPU automatically on first Tier-2 prompt)")
+        except Exception as exc:
+            print(f"Model Details Error  : {exc}")
+    print("=" * 60)
+    return 0
+
+
 def run_text_repl(config: LocalGuardianConfig, *, dry_run: bool = False) -> int:
     _policy, _audit, registry, orchestrator = _build_runtime(
         config,
@@ -115,6 +162,7 @@ def run_text_repl(config: LocalGuardianConfig, *, dry_run: bool = False) -> int:
     )
     mode_tag = " [DRY-RUN]" if dry_run else ""
     print(f"LocalGuardian v{__version__} — Interactive Text Mode{mode_tag}")
+    print(f"Models: Tier-1 Fast Grammar (CPU) -> Tier-2 {config.llm.provider}/{config.llm.model} | Browser #1: {config.browser.priority}")
     print("Try: 'Windows, increase the brightness' | 'go to Chrome and type Elon Musk' | 'delete C:\\Windows'")
     print("Type 'exit' or 'quit' to stop.\n")
 
@@ -202,6 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config file.")
     parser.add_argument("--dry-run", action="store_true", help="Simulate tool execution without changing Windows.")
     parser.add_argument("--doctor", action="store_true", help="Run system, safety, Chrome, and Ollama self-checks.")
+    parser.add_argument("--models", action="store_true", help="Show active local LLM, STT, and Ollama VRAM details.")
     parser.add_argument("--text", action="store_true", help="Start interactive text command console.")
     parser.add_argument("--voice", action="store_true", help="Start push-to-talk local voice mode.")
     parser.add_argument("--once", type=str, default=None, help="Execute a single command and exit.")
@@ -216,6 +265,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.doctor:
         return run_doctor(config)
+    if args.models:
+        return run_models_info(config)
     if args.audit:
         return run_audit_view(config)
     if args.mcp:
