@@ -1,9 +1,9 @@
-"""Typed Tool Registry wrapping every OS/Chrome tool behind SafetyPolicy + AuditLogger."""
+"""Typed Tool Registry wrapping every OS/Window/Chrome tool behind SafetyPolicy + AuditLogger."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Type
+from typing import Any, Callable, Dict, List, Literal, Optional, Type
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -14,6 +14,7 @@ from localguardian.safety.failsafe import FailsafeController, FailsafeTriggeredE
 from localguardian.safety.policy import PolicyVerdict, RiskLevel, SafetyPolicy
 from localguardian.tools.browser import ChromeController
 from localguardian.tools.os_controls import OSControls
+from localguardian.tools.window_tools import WindowController
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +45,12 @@ class ToggleMuteArgs(BaseModel):
     mute: Optional[bool] = Field(default=None, description="True to mute, False to unmute, or null to toggle.")
 
 
+class MediaControlArgs(BaseModel):
+    action: Literal["play_pause", "next", "previous"] = Field(
+        ..., description="Media playback action: play_pause, next, or previous."
+    )
+
+
 class OpenAppArgs(BaseModel):
     app_name: str = Field(..., description="Allowlisted app name: chrome, notepad, calculator, paint, edge, vscode.")
 
@@ -54,6 +61,30 @@ class ChromeOpenUrlArgs(BaseModel):
 
 class ChromeSearchArgs(BaseModel):
     query: str = Field(..., min_length=1, max_length=500, description="Search query to type and search in Google Chrome.")
+
+
+class FocusWindowArgs(BaseModel):
+    window_name: str = Field(..., min_length=1, max_length=120, description="App or window title to bring to front.")
+
+
+class SnapWindowArgs(BaseModel):
+    window_name: str = Field(..., min_length=1, max_length=120, description="Open app or window title to snap.")
+    position: Literal["left", "right", "maximize", "minimize"] = Field(
+        ..., description="Target layout: left, right, maximize, or minimize."
+    )
+
+
+class TakeScreenshotArgs(BaseModel):
+    filename: Optional[str] = Field(
+        default=None,
+        description="Optional simple PNG filename (saved strictly inside ~/LocalGuardian_Workspace/screenshots/).",
+    )
+
+
+class ActivateWorkspaceModeArgs(BaseModel):
+    mode: Literal["coding", "study", "focus", "relax"] = Field(
+        ..., description="Preset workspace mode: coding, study, focus, or relax."
+    )
 
 
 @dataclass(frozen=True)
@@ -87,6 +118,7 @@ class ToolRegistry:
         failsafe: Optional[FailsafeController] = None,
         os_controls: Optional[OSControls] = None,
         chrome: Optional[ChromeController] = None,
+        windows: Optional[WindowController] = None,
         keep_browser_open_on_oneshot: bool = False,
     ) -> None:
         self.config = config
@@ -96,6 +128,7 @@ class ToolRegistry:
         self.failsafe = failsafe or FailsafeController(enable_corner_slam=False)
         self.os_controls = os_controls or OSControls(config)
         self.chrome = chrome or ChromeController(config)
+        self.windows = windows or WindowController()
         self.keep_browser_open_on_oneshot = keep_browser_open_on_oneshot
         self._specs: Dict[str, ToolSpec] = {}
         self._register_builtin_tools()
@@ -145,6 +178,12 @@ class ToolRegistry:
                 handler=lambda a: self.os_controls.toggle_mute(a.mute),  # type: ignore[attr-defined]
             ),
             ToolSpec(
+                name="media_control",
+                description="Control media playback across Spotify, Chrome, or media apps: play_pause, next, or previous.",
+                args_model=MediaControlArgs,
+                handler=lambda a: self.os_controls.media_control(a.action),  # type: ignore[attr-defined]
+            ),
+            ToolSpec(
                 name="open_app",
                 description="Open an allowlisted desktop application (chrome, notepad, calculator, paint, edge, vscode).",
                 args_model=OpenAppArgs,
@@ -173,8 +212,38 @@ class ToolRegistry:
                 handler=lambda _: self.chrome.get_page_info(),
             ),
             ToolSpec(
+                name="list_open_windows",
+                description="List currently visible open desktop windows (read-only).",
+                args_model=EmptyArgs,
+                handler=lambda _: self.windows.list_open_windows(),
+            ),
+            ToolSpec(
+                name="focus_window",
+                description="Restore and focus an open desktop window by app or title (e.g., chrome, notepad, vscode).",
+                args_model=FocusWindowArgs,
+                handler=lambda a: self.windows.focus_window(a.window_name),  # type: ignore[attr-defined]
+            ),
+            ToolSpec(
+                name="snap_window",
+                description="Snap an open window to the left half, right half, maximize, or minimize.",
+                args_model=SnapWindowArgs,
+                handler=lambda a: self.windows.snap_window(a.window_name, a.position),  # type: ignore[attr-defined]
+            ),
+            ToolSpec(
+                name="take_screenshot",
+                description="Save a PNG screenshot strictly inside ~/LocalGuardian_Workspace/screenshots/.",
+                args_model=TakeScreenshotArgs,
+                handler=lambda a: self.os_controls.take_screenshot(a.filename),  # type: ignore[attr-defined]
+            ),
+            ToolSpec(
+                name="activate_workspace_mode",
+                description="Apply a safe 1-command workspace preset (coding, study, focus, or relax).",
+                args_model=ActivateWorkspaceModeArgs,
+                handler=lambda a: self.os_controls.activate_workspace_mode(a.mode),  # type: ignore[attr-defined]
+            ),
+            ToolSpec(
                 name="get_system_status",
-                description="Read-only check of Windows brightness, volume, and battery status.",
+                description="Read-only check of brightness, volume, battery, CPU, RAM, and GPU temperature/VRAM.",
                 args_model=EmptyArgs,
                 handler=lambda _: self.os_controls.get_system_status(),
             ),

@@ -210,11 +210,17 @@ TOOL_BASE_RISK: Dict[str, RiskLevel] = {
     "set_volume": RiskLevel.SAFE,
     "adjust_volume": RiskLevel.SAFE,
     "toggle_mute": RiskLevel.SAFE,
+    "media_control": RiskLevel.SAFE,
     "open_app": RiskLevel.SAFE,
     "chrome_open_url": RiskLevel.SAFE,
     "chrome_search": RiskLevel.SAFE,
     "chrome_get_page_info": RiskLevel.SAFE,
     "get_system_status": RiskLevel.SAFE,
+    "list_open_windows": RiskLevel.SAFE,
+    "focus_window": RiskLevel.SAFE,
+    "snap_window": RiskLevel.SAFE,
+    "take_screenshot": RiskLevel.SAFE,
+    "activate_workspace_mode": RiskLevel.SAFE,
     "read_user_file": RiskLevel.SAFE,
     "write_user_file": RiskLevel.MEDIUM,
     "send_hotkey": RiskLevel.MEDIUM,
@@ -629,6 +635,65 @@ class SafetyPolicy:
                     risk=RiskLevel.FORBIDDEN,
                     rule_id="INVALID_VOLUME_DELTA",
                     reason="Volume delta must be an integer between -100 and +100.",
+                )
+
+        if name == "media_control":
+            action = str(args.get("action", "")).strip().lower()
+            if action not in {"play_pause", "next", "previous"}:
+                return PolicyVerdict(
+                    allowed=False,
+                    risk=RiskLevel.FORBIDDEN,
+                    rule_id="INVALID_MEDIA_ACTION",
+                    reason="Media action must be one of: play_pause, next, previous.",
+                )
+
+        if name == "snap_window":
+            pos = str(args.get("position", "")).strip().lower()
+            if pos not in {"left", "right", "maximize", "minimize"}:
+                return PolicyVerdict(
+                    allowed=False,
+                    risk=RiskLevel.FORBIDDEN,
+                    rule_id="INVALID_SNAP_POSITION",
+                    reason="Window snap position must be one of: left, right, maximize, minimize.",
+                )
+
+        if name == "take_screenshot":
+            raw_fn = args.get("filename")
+            if raw_fn is not None:
+                fn = str(raw_fn).strip()
+                if (
+                    not fn
+                    or "/" in fn
+                    or "\\" in fn
+                    or ".." in fn
+                    or ":" in fn
+                    or not re.match(r"^[a-zA-Z0-9._-]+$", fn)
+                ):
+                    return PolicyVerdict(
+                        allowed=False,
+                        risk=RiskLevel.FORBIDDEN,
+                        rule_id="BLOCKED_SCREENSHOT_PATH",
+                        reason=(
+                            "Screenshot filename must be a simple name (no directory paths or '..'); "
+                            "files are strictly sandboxed inside ~/LocalGuardian_Workspace/screenshots/."
+                        ),
+                    )
+                if Path(fn).suffix.lower() in EXECUTABLE_EXTENSIONS:
+                    return PolicyVerdict(
+                        allowed=False,
+                        risk=RiskLevel.FORBIDDEN,
+                        rule_id="BLOCKED_EXECUTABLE_WRITE",
+                        reason="Screenshots may only be saved as .png image files.",
+                    )
+
+        if name == "activate_workspace_mode":
+            mode = str(args.get("mode", "")).strip().lower()
+            if mode not in {"coding", "study", "focus", "relax"}:
+                return PolicyVerdict(
+                    allowed=False,
+                    risk=RiskLevel.FORBIDDEN,
+                    rule_id="INVALID_WORKSPACE_MODE",
+                    reason="Workspace mode must be one of: coding, study, focus, relax.",
                 )
 
         base_risk = TOOL_BASE_RISK[name]

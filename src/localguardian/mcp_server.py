@@ -1,7 +1,7 @@
-"""LocalGuardian FastMCP Server.
+"""LocalGuardian MCP Server (compatible with mcp 2.x MCPServer and mcp 1.x FastMCP).
 
-Exposes the exact same safety-gated Windows OS and Google Chrome tools over the
-standard Model Context Protocol (MCP) using the official `mcp` Python SDK.
+Exposes all safety-gated Windows OS, window management, and Google Chrome tools
+over standard Model Context Protocol (MCP) stdio transport.
 """
 
 from __future__ import annotations
@@ -73,6 +73,11 @@ def create_mcp_server(
         return registry.invoke("toggle_mute", {"mute": mute}, route_tier="mcp").message
 
     @mcp.tool()
+    def media_control(action: str) -> str:
+        """Control media playback: play_pause, next, or previous."""
+        return registry.invoke("media_control", {"action": action}, route_tier="mcp").message
+
+    @mcp.tool()
     def open_app(app_name: str) -> str:
         """Launch an allowlisted desktop application (chrome, notepad, calculator, paint, edge, vscode)."""
         return registry.invoke("open_app", {"app_name": app_name}, route_tier="mcp").message
@@ -88,8 +93,35 @@ def create_mcp_server(
         return registry.invoke("chrome_open_url", {"url": url}, route_tier="mcp").message
 
     @mcp.tool()
+    def list_open_windows() -> str:
+        """List currently visible desktop windows (read-only)."""
+        return registry.invoke("list_open_windows", {}, route_tier="mcp").message
+
+    @mcp.tool()
+    def focus_window(window_name: str) -> str:
+        """Bring an open desktop window to the foreground."""
+        return registry.invoke("focus_window", {"window_name": window_name}, route_tier="mcp").message
+
+    @mcp.tool()
+    def snap_window(window_name: str, position: str) -> str:
+        """Snap an open window: left, right, maximize, or minimize."""
+        return registry.invoke(
+            "snap_window", {"window_name": window_name, "position": position}, route_tier="mcp"
+        ).message
+
+    @mcp.tool()
+    def take_screenshot(filename: Optional[str] = None) -> str:
+        """Save a PNG screenshot strictly inside ~/LocalGuardian_Workspace/screenshots/."""
+        return registry.invoke("take_screenshot", {"filename": filename}, route_tier="mcp").message
+
+    @mcp.tool()
+    def activate_workspace_mode(mode: str) -> str:
+        """Activate a safe workspace preset: coding, study, focus, or relax."""
+        return registry.invoke("activate_workspace_mode", {"mode": mode}, route_tier="mcp").message
+
+    @mcp.tool()
     def get_system_status() -> str:
-        """Read-only check of Windows brightness, volume, and battery status."""
+        """Read-only check of brightness, volume, battery, CPU, RAM, and GPU."""
         return registry.invoke("get_system_status", {}, route_tier="mcp").message
 
     return mcp

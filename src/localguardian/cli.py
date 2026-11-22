@@ -1,12 +1,14 @@
 """LocalGuardian CLI entry point (`localguardian`).
 
 Modes:
-    localguardian --doctor               Verify hardware, safety blocks, Chrome, Ollama, voice
-    localguardian --text [--dry-run]     Interactive text command console
-    localguardian --voice [--dry-run]    Push-to-talk local voice command console (faster-whisper CPU)
-    localguardian --once "<cmd>"         Execute a single command and exit
-    localguardian --mcp [--dry-run]      Start FastMCP stdio server
-    localguardian --audit                Show recent local SQLite audit log entries
+    localguardian --doctor                     Verify hardware, safety, Chrome, Cactus Needle, Ollama, voice
+    localguardian --models                     Show all 3 routing tiers, Cactus Needle, Ollama VRAM, and STT
+    localguardian --text [--dry-run]           Interactive text command console
+    localguardian --voice [--stt whisper|whistle] [--dry-run]
+                                               Push-to-talk local voice console
+    localguardian --once "<cmd>" [--dry-run]   Execute a single command and exit
+    localguardian --mcp [--dry-run]            Start MCP stdio server
+    localguardian --audit                      Show recent local SQLite audit log entries
 """
 
 from __future__ import annotations
@@ -17,7 +19,8 @@ from typing import Optional
 
 from localguardian import __version__
 from localguardian.brain.llm_planner import LocalLLMPlanner
-from localguardian.brain.orchestrator import LocalGuardianOrchestrator
+from localguardian.brain.needle_router import cactus_status
+from localguardian.brain.orchestrator import LocalGuardianOrchestrator, OrchestratorResult
 from localguardian.config import LocalGuardianConfig, load_config
 from localguardian.safety.audit import AuditLogger
 from localguardian.safety.confirm import ConfirmationChannel, ConfirmationManager
@@ -49,24 +52,35 @@ def _build_runtime(
     return policy, audit, registry, orchestrator
 
 
-def run_doctor(config: LocalGuardianConfig) -> int:
-    """Verify environment, Chrome #1 priority, safety core, Ollama, and voice packages."""
-    print(f"LocalGuardian v{__version__} — System & Safety Doctor")
-    print("=" * 60)
+def _format_route_tag(res: OrchestratorResult) -> str:
+    if res.route_tier == "tier1_5_cactus_needle" and res.needle_trace:
+        conf = res.needle_trace.get("confidence", 0.0)
+        ms = res.needle_trace.get("latency_ms", 0.0)
+        return f"tier1_5_cactus_needle | conf={conf:.2f}, {ms:.0f}ms"
+    if res.route_tier == "tier2_ollama" and res.needle_trace.get("status") == "evaluated":
+        conf = res.needle_trace.get("confidence", 0.0)
+        return f"tier2_ollama (escalated from needle conf={conf:.2f})"
+    return res.route_tier
 
-    # 1. Python & Privilege check
+
+def run_doctor(config: LocalGuardianConfig) -> int:
+    """Verify environment, Chrome #1 priority, safety core, Cactus Needle, Ollama, and voice."""
+    print(f"LocalGuardian v{__version__} — System & Safety Doctor")
+    print("=" * 64)
+
     admin = is_running_as_admin()
     print(f"[{'WARN' if admin else 'OK  '}] Python {sys.version.split()[0]} | Admin privilege: {admin} (recommended: False)")
 
-    # 2. Safety self-test
     policy = SafetyPolicy(config)
     checks = [
         ("Block C:\\Windows", not policy.check_path(r"C:\Windows\System32\cmd.exe", write=True).allowed),
         ("Block C:\\Program Files", not policy.check_path(r"C:\Program Files\test.txt", write=True).allowed),
         ("Block raw PowerShell", not policy.evaluate("run_powershell", {"command": "dir"}).allowed),
         ("Block Win+R hotkey", not policy.evaluate("send_hotkey", {"keys": ["win", "r"]}).allowed),
+        ("Block screenshot path escape", not policy.evaluate("take_screenshot", {"filename": r"..\..\Windows\x.png"}).allowed),
         ("Allow Chrome search", policy.evaluate("chrome_search", {"query": "Elon Musk"}).allowed),
         ("Allow brightness +20", policy.evaluate("adjust_brightness", {"delta": 20}).allowed),
+        ("Allow window snap", policy.evaluate("snap_window", {"window_name": "chrome", "position": "left"}).allowed),
     ]
     all_safe = True
     for label, passed in checks:
@@ -75,16 +89,27 @@ def run_doctor(config: LocalGuardianConfig) -> int:
             all_safe = False
         print(f"[{tag}] Safety check — {label}")
 
-    # 3. Google Chrome (#1 priority browser)
     chrome_exe = find_chrome_executable(config)
     print(f"[{'OK  ' if chrome_exe else 'WARN'}] Chrome (#1 priority): {chrome_exe or 'Not found in standard paths'}")
 
-    # 4. Optional Python libraries
+    # Cactus Compute check
+    cinfo = cactus_status()
+    if cinfo["installed"]:
+        print(
+            f"[OK  ] Cactus Compute v{cinfo['version']}: "
+            f"Needle={cinfo['needle']}, Whistle={cinfo['whistle']}, Mirage={cinfo['mirage']} "
+            f"(enabled={config.needle.enabled}, min_conf={config.needle.min_confidence})"
+        )
+    else:
+        print(f"[INFO] Cactus Compute: not installed (optional Tier-1.5; pip install cactus-compute)")
+
     for mod_name, label in [
         ("screen_brightness_control", "Brightness API (screen-brightness-control)"),
         ("pycaw", "Audio API (pycaw)"),
+        ("psutil", "System Diagnostics (psutil)"),
+        ("PIL", "Screenshot Capture (Pillow)"),
         ("playwright", "Browser Automation (playwright)"),
-        ("mcp", "MCP Server SDK (mcp / FastMCP)"),
+        ("mcp", "MCP Server SDK (mcp)"),
         ("faster_whisper", "Offline Voice STT (faster-whisper)"),
         ("sounddevice", "Microphone Capture (sounddevice)"),
     ]:
@@ -94,7 +119,6 @@ def run_doctor(config: LocalGuardianConfig) -> int:
         except Exception:
             print(f"[MISS] {label}: not installed")
 
-    # 5. Ollama local LLM
     planner = LocalLLMPlanner(config)
     ok, models, msg = planner.health_check()
     print(f"[{'OK  ' if ok else 'INFO'}] Ollama LLM ({config.llm.model}): {msg}")
@@ -102,36 +126,47 @@ def run_doctor(config: LocalGuardianConfig) -> int:
         print(f"       Available Ollama models: {', '.join(models)}")
 
     print(f"[OK  ] Audit DB path: {config.audit_db_path}")
-    print("=" * 60)
+    print("=" * 64)
     return 0 if all_safe else 1
 
 
 def run_models_info(config: LocalGuardianConfig) -> int:
-    """Display configured and live local model details (LLM, voice STT, Ollama status)."""
+    """Display all 3 cognitive cascade tiers, Cactus Needle, Ollama VRAM, and STT."""
     import httpx
 
-    print(f"LocalGuardian v{__version__} — Active Models & Runtime")
-    print("=" * 60)
-    print("Tier 1 (Fast Router) : Deterministic Fast Grammar (CPU, <1 ms)")
-    print(f"Tier 2 (Local LLM)   : {config.llm.provider} -> {config.llm.model} ({config.llm.base_url})")
-    print(f"Voice STT            : {config.voice.stt_backend} ({config.voice.stt_model}, device={config.voice.stt_device}, compute={config.voice.stt_compute_type})")
-    print(f"Browser Priority     : {config.browser.priority} (fallback: {config.browser.fallback})")
+    cinfo = cactus_status()
+    needle_state = (
+        f"cactus-compute v{cinfo['version']} Needle (CPU, ~70-130 ms, min_conf={config.needle.min_confidence})"
+        if (cinfo["installed"] and cinfo["needle"] and config.needle.enabled)
+        else ("DISABLED (--no-needle)" if not config.needle.enabled else "not installed")
+    )
+
+    print(f"LocalGuardian v{__version__} — Active 3-Tier Cascade & Runtime")
+    print("=" * 64)
+    print("Tier 1   (Fast Grammar) : Pure Python deterministic regex (CPU, <1 ms)")
+    print(f"Tier 1.5 (Edge Router)  : {needle_state}")
+    print(f"Tier 2   (Local LLM)    : {config.llm.provider} -> {config.llm.model} ({config.llm.base_url})")
+    print(
+        f"Voice STT               : {config.voice.stt_backend} "
+        f"(model={config.voice.stt_model}, device={config.voice.stt_device}, compute={config.voice.stt_compute_type})"
+    )
+    print(f"Browser Priority        : {config.browser.priority} (fallback: {config.browser.fallback})")
 
     planner = LocalLLMPlanner(config)
     ok, models, msg = planner.health_check()
-    print(f"Ollama Status        : {'ONLINE' if ok else 'OFFLINE'} — {msg}")
+    print(f"Ollama Status           : {'ONLINE' if ok else 'OFFLINE'} — {msg}")
 
     if ok:
         base = config.llm.base_url.rstrip("/")
         root = base[:-3] if base.endswith("/v1") else base
-        print(f"Installed Models     : {', '.join(models) if models else '(none pulled yet)'}")
+        print(f"Installed Ollama Models : {', '.join(models) if models else '(none pulled yet)'}")
         try:
             with httpx.Client(timeout=4.0) as client:
                 show = client.post(f"{root}/api/show", json={"name": config.llm.model})
                 if show.status_code == 200:
                     details = show.json().get("details") or {}
                     print(
-                        "Configured Model Info: "
+                        "Configured Model Info   : "
                         f"family={details.get('family', '?')} | "
                         f"params={details.get('parameter_size', '?')} | "
                         f"quant={details.get('quantization_level', '?')} | "
@@ -144,12 +179,12 @@ def run_models_info(config: LocalGuardianConfig) -> int:
                         for rm in running:
                             vram_mb = round(rm.get("size_vram", 0) / (1024 * 1024))
                             total_mb = round(rm.get("size", 0) / (1024 * 1024))
-                            print(f"Loaded in Memory     : {rm.get('name')} ({vram_mb} MB VRAM / {total_mb} MB total)")
+                            print(f"Loaded in GPU Memory    : {rm.get('name')} ({vram_mb} MB VRAM / {total_mb} MB total)")
                     else:
-                        print("Loaded in Memory     : (idle — loads onto GPU automatically on first Tier-2 prompt)")
+                        print("Loaded in GPU Memory    : (idle — loads onto GPU automatically on first Tier-2 prompt)")
         except Exception as exc:
-            print(f"Model Details Error  : {exc}")
-    print("=" * 60)
+            print(f"Model Details Error     : {exc}")
+    print("=" * 64)
     return 0
 
 
@@ -161,9 +196,10 @@ def run_text_repl(config: LocalGuardianConfig, *, dry_run: bool = False) -> int:
         oneshot=False,
     )
     mode_tag = " [DRY-RUN]" if dry_run else ""
+    needle_tag = "Cactus Needle 3" if config.needle.enabled else "off"
     print(f"LocalGuardian v{__version__} — Interactive Text Mode{mode_tag}")
-    print(f"Models: Tier-1 Fast Grammar (CPU) -> Tier-2 {config.llm.provider}/{config.llm.model} | Browser #1: {config.browser.priority}")
-    print("Try: 'Windows, increase the brightness' | 'go to Chrome and type Elon Musk' | 'delete C:\\Windows'")
+    print(f"Cascade: Fast Grammar -> {needle_tag} (CPU) -> {config.llm.provider}/{config.llm.model} (GPU)")
+    print("Try: 'Windows, increase the brightness' | 'put chrome on the left' | 'pause music' | 'delete C:\\Windows'")
     print("Type 'exit' or 'quit' to stop.\n")
 
     try:
@@ -178,7 +214,7 @@ def run_text_repl(config: LocalGuardianConfig, *, dry_run: bool = False) -> int:
             if cmd.lower() in {"exit", "quit", "q"}:
                 break
             res = orchestrator.handle(cmd, dry_run=dry_run)
-            print(f"  [{res.route_tier}] {res.message}\n")
+            print(f"  [{_format_route_tag(res)}] {res.message}\n")
     finally:
         registry.close()
     return 0
@@ -197,7 +233,11 @@ def run_voice_repl(config: LocalGuardianConfig, *, dry_run: bool = False) -> int
     listener = PushToTalkListener(config)
     stt = LocalTranscriber(config)
     mode_tag = " [DRY-RUN]" if dry_run else ""
-    print(f"LocalGuardian v{__version__} — Local Voice Mode (faster-whisper {config.voice.stt_model} on {config.voice.stt_device}){mode_tag}")
+    print(
+        f"LocalGuardian v{__version__} — Local Voice Mode "
+        f"(STT: {config.voice.stt_backend} on CPU | Needle: {'on' if config.needle.enabled else 'off'} | "
+        f"LLM: {config.llm.model}){mode_tag}"
+    )
     print("Press ENTER to start speaking, press ENTER again to finish, or Ctrl+C to quit.\n")
 
     try:
@@ -213,14 +253,14 @@ def run_voice_repl(config: LocalGuardianConfig, *, dry_run: bool = False) -> int
             if audio is None:
                 print("  No audio captured.\n")
                 continue
-            print("  Transcribing locally on CPU...")
+            print(f"  Transcribing locally via {config.voice.stt_backend}...")
             transcript = stt.transcribe_array(audio)
             print(f"  Heard: {transcript!r}")
             if not transcript:
                 print("  Nothing understood.\n")
                 continue
             res = orchestrator.handle(transcript, dry_run=dry_run)
-            print(f"  [{res.route_tier}] {res.message}\n")
+            print(f"  [{_format_route_tag(res)}] {res.message}\n")
     finally:
         registry.close()
     return 0
@@ -249,12 +289,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config file.")
     parser.add_argument("--dry-run", action="store_true", help="Simulate tool execution without changing Windows.")
-    parser.add_argument("--doctor", action="store_true", help="Run system, safety, Chrome, and Ollama self-checks.")
-    parser.add_argument("--models", action="store_true", help="Show active local LLM, STT, and Ollama VRAM details.")
+    parser.add_argument("--no-needle", action="store_true", help="Disable Tier-1.5 Cactus Needle router for this run.")
+    parser.add_argument(
+        "--stt",
+        choices=["whisper", "whistle"],
+        default=None,
+        help="Override local CPU STT backend: 'whisper' (faster-whisper) or 'whistle' (Cactus Whistle 16.9 MB).",
+    )
+    parser.add_argument("--doctor", action="store_true", help="Run system, safety, Chrome, Cactus, and Ollama checks.")
+    parser.add_argument("--models", action="store_true", help="Show active 3-tier cascade, Cactus Needle, Ollama VRAM, and STT.")
     parser.add_argument("--text", action="store_true", help="Start interactive text command console.")
     parser.add_argument("--voice", action="store_true", help="Start push-to-talk local voice mode.")
     parser.add_argument("--once", type=str, default=None, help="Execute a single command and exit.")
-    parser.add_argument("--mcp", action="store_true", help="Run LocalGuardian as a FastMCP stdio server.")
+    parser.add_argument("--mcp", action="store_true", help="Run LocalGuardian as an MCP stdio server.")
     parser.add_argument("--audit", action="store_true", help="Display recent SQLite audit log entries.")
     return parser
 
@@ -262,6 +309,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     config = load_config(args.config)
+
+    if args.no_needle:
+        config.needle.enabled = False
+    if args.stt == "whisper":
+        config.voice.stt_backend = "faster-whisper"
+    elif args.stt == "whistle":
+        config.voice.stt_backend = "cactus-whistle"
 
     if args.doctor:
         return run_doctor(config)
@@ -283,14 +337,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         try:
             res = orchestrator.handle(args.once, dry_run=args.dry_run)
-            print(f"[{res.route_tier}] {res.message}")
+            print(f"[{_format_route_tag(res)}] {res.message}")
             return 0
         finally:
             registry.close()
     if args.voice:
         return run_voice_repl(config, dry_run=args.dry_run)
 
-    # Default to interactive text mode when run directly
     return run_text_repl(config, dry_run=args.dry_run)
 
 
