@@ -1,0 +1,56 @@
+# LocalGuardian default configuration
+# Protected system paths (C:\Windows, Program Files, AppData, Registry, secrets)
+# are HARD-CODED in safety/policy.py and CANNOT be disabled from config.
+
+profile: balanced  # lite | balanced | pro
+
+browser:
+  priority: chrome          # Priority #1 default browser (Playwright channel="chrome")
+  fallback: msedge          # Used only if Google Chrome is not installed
+  default_search_engine: "https://www.google.com/search?q={query}"
+
+llm:
+  provider: ollama
+  base_url: "http://127.0.0.1:11434/v1"
+  model: "qwen3:4b"         # Best fast model for RTX 4050 (6 GB VRAM); alternative: qwen3:8b
+  timeout_seconds: 30
+
+voice:
+  stt_backend: faster-whisper
+  stt_model: "base.en"
+  stt_device: "cpu"         # Keeps 100% of GPU VRAM dedicated to Ollama LLM
+  stt_compute_type: "int8"
+  wake_word: "hey_jarvis"
+
+safety:
+  dry_run: false
+  confirm_medium_risk: true
+  allow_file_tools: false   # Opt-in only; restricted to allowlisted user folders below
+  allowed_user_folders:
+    - "~/LocalGuardian_Workspace"
+  allowed_apps:
+    chrome:
+      display_name: "Google Chrome"
+      candidates:
+        - "%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe"
+        - "%ProgramFiles(x86)%\\Google\\Chrome\\Application\\chrome.exe"
+        - "%LocalAppData%\\Google\\Chrome\\Application\\chrome.exe"
+    notepad:
+      display_name: "Notepad"
+      command: "notepad.exe"
+    calculator:
+      display_name: "Calculator"
+      command: "calc.exe"
+    paint:
+      display_name: "Paint"
+      command: "mspaint.exe"
+    edge:
+      display_name: "Microsoft Edge"
+      candidates:
+        - "%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe"
+        - "%ProgramFiles%\\Microsoft\\Edge\\Application\\msedge.exe"
+    vscode:
+      display_name: "Visual Studio Code"
+      candidates:
+        - "%LocalAppData%\\Programs\\Microsoft VS Code\\Code.exe"
+        - "%ProgramFiles%\\Microsoft VS Code\\Code.exe"

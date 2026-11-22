@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Local runtime state & sensitive user data
+.localguardian/
+*.db
+*.sqlite
+*.sqlite3
+*.wav
+*.mp3
+*.log
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/

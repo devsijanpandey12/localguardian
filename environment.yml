@@ -1,0 +1,8 @@
+name: localguardian
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - -e .[browser,mcp,dev]
