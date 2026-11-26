@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "localguardian"
-version = "0.2.0"
+version = "0.3.0"
 description = "Voice-Driven Local LLM Agent for Sandboxed Windows OS and Browser Automation"
 readme = "README.md"
 requires-python = ">=3.10"

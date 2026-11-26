@@ -26,6 +26,7 @@ class NeedleConfig(BaseModel):
     enabled: bool = True
     min_confidence: float = 0.65
     max_new_tokens: int = 96
+    timeout_seconds: float = 5.0
     disable_telemetry: bool = True
 
 
@@ -33,7 +34,8 @@ class LLMConfig(BaseModel):
     provider: str = "ollama"
     base_url: str = "http://127.0.0.1:11434/v1"
     model: str = "qwen3:4b"
-    timeout_seconds: float = 90.0
+    timeout_seconds: float = 25.0
+    max_tokens: int = 768
 
 
 class VoiceConfig(BaseModel):

@@ -13,13 +13,15 @@ needle:
   enabled: true
   min_confidence: 0.65      # Escalates to Tier-2 Ollama qwen3:4b whenever confidence < 0.65
   max_new_tokens: 96
+  timeout_seconds: 5.0      # Hard timeout so Cactus Needle can never freeze the CLI
   disable_telemetry: true
 
 llm:
   provider: ollama
   base_url: "http://127.0.0.1:11434/v1"
   model: "qwen3:4b"         # Best fast model for RTX 4050 (6 GB VRAM); alternative: qwen3:8b
-  timeout_seconds: 90
+  timeout_seconds: 25       # Responsive hard cap; prevents long silent hangs on bad input
+  max_tokens: 768           # Enough room for Qwen3 reasoning + tool calls without rambling
 
 voice:
   stt_backend: faster-whisper  # faster-whisper | cactus-whistle

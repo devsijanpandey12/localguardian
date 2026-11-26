@@ -1,19 +1,20 @@
-"""Tier-1 deterministic fast grammar parser (CPU, <1 ms, zero VRAM).
+"""Tier-1 deterministic fast grammar parser, pre-flight guard, and typo normalizer (CPU, <1 ms).
 
-Handles common direct voice/text commands immediately without waking the GPU LLM:
-- "Windows, increase the brightness" / "set brightness to 70"
-- "decrease volume by 15" / "mute" / "unmute"
-- "go to Chrome and type Elon Musk" / "open Chrome and search Elon Musk"
-- "open youtube.com in Chrome" / "open Chrome" / "open notepad"
-- "check system status" / "check battery"
-- Adversarial unsafe phrases (e.g., "delete C:\\Windows", "run powershell") ->
-  mapped cleanly into forbidden tool calls so SafetyPolicy blocks and audits them.
+Upgrades in v0.3.0:
+- Pre-flight input guard (`check_preflight`): instantly handles `help`, `undo`,
+  greetings/small-talk, and obvious keyboard mash/gibberish in <1 ms instead of
+  wasting 5-25s escalating nonsense to Cactus Needle and Ollama Qwen3.
+- Conservative typo normalizer (`normalize_typos`): fixes common command/app
+  misspellings ("open chorme", "incrase brigtness", "volum down") in <1 ms
+  without altering search queries.
+- Smart command suggestions (`suggest_examples`) for unrecognized input.
 """
 
 from __future__ import annotations
 
+import difflib
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -45,6 +46,120 @@ _UNSAFE_SYSFILE_RE = re.compile(
     re.IGNORECASE,
 )
 
+HELP_TEXT = """Available LocalGuardian Commands:
+  Display  : increase/decrease brightness [by N] | set brightness to 70 | check brightness
+  Audio    : increase/decrease volume [by N] | set volume to 40 | mute | unmute
+  Media    : pause music | next track | previous song
+  Chrome   : go to Chrome and type <query> | search <query> | open <site.com> in chrome
+  Apps     : open chrome | open notepad | open calculator | open paint | open vscode
+  Windows  : list open windows | put chrome on the left | maximize chrome | focus notepad
+  Extras   : take a screenshot | switch to coding/study/focus/relax mode | check system status
+  Session  : undo | help | models | audit | dry-run on/off | exit"""
+
+EXAMPLE_COMMANDS: Tuple[str, ...] = (
+    "increase the brightness",
+    "decrease the brightness",
+    "set brightness to 70",
+    "increase volume",
+    "decrease volume",
+    "set volume to 40",
+    "mute",
+    "unmute",
+    "pause music",
+    "next track",
+    "go to Chrome and type Elon Musk",
+    "open github.com in chrome",
+    "open chrome",
+    "open notepad",
+    "open calculator",
+    "list open windows",
+    "put chrome on the left",
+    "maximize chrome",
+    "take a screenshot",
+    "switch to study mode",
+    "check system status",
+    "undo",
+    "help",
+)
+
+# Strictly curated command/app keywords eligible for conservative typo repair.
+_COMMAND_VOCAB: Tuple[str, ...] = (
+    "brightness",
+    "brighter",
+    "dimmer",
+    "increase",
+    "decrease",
+    "volume",
+    "mute",
+    "unmute",
+    "chrome",
+    "notepad",
+    "calculator",
+    "vscode",
+    "spotify",
+    "search",
+    "google",
+    "screenshot",
+    "windows",
+    "maximize",
+    "minimize",
+    "pause",
+    "resume",
+    "previous",
+    "status",
+    "battery",
+    "coding",
+    "study",
+    "focus",
+    "relax",
+    "launch",
+    "open",
+)
+
+_TYPO_OVERRIDES: Dict[str, str] = {
+    "chorme": "chrome",
+    "crome": "chrome",
+    "chrom": "chrome",
+    "brigtness": "brightness",
+    "brightnes": "brightness",
+    "britness": "brightness",
+    "incrase": "increase",
+    "increse": "increase",
+    "decrase": "decrease",
+    "decrese": "decrease",
+    "volum": "volume",
+    "voluem": "volume",
+    "volme": "volume",
+    "opne": "open",
+    "opn": "open",
+    "notpad": "notepad",
+    "notepd": "notepad",
+    "puse": "pause",
+    "serch": "search",
+    "screnshot": "screenshot",
+    "screensht": "screenshot",
+    "windws": "windows",
+}
+
+_SMALL_TALK_RE = re.compile(
+    r"^(?:hi|hello|hey|yo|sup|good\s+(?:morning|afternoon|evening)|"
+    r"thanks|thank\s+you|thx|ok|okay|cool|nice|great|awesome|bye|goodbye|test|testing)$",
+    re.IGNORECASE,
+)
+
+_HELP_RE = re.compile(
+    r"^(?:help|\?|commands|list\s+commands|what\s+can\s+you\s+do|show\s+help)$",
+    re.IGNORECASE,
+)
+
+_UNDO_RE = re.compile(
+    r"^(?:undo(?:\s+(?:that|last(?:\s+action)?))?|revert(?:\s+last(?:\s+action)?)?)$",
+    re.IGNORECASE,
+)
+
+_QUERY_STOP_WORDS = frozenset({"search", "type", "google", "find", "named", "as"})
+_VOWELS = frozenset("aeiouy")
+
 
 def _strip_prefixes(text: str) -> str:
     cleaned = text.strip().rstrip(".!?")
@@ -57,6 +172,150 @@ def _strip_prefixes(text: str) -> str:
     return cleaned
 
 
+def _looks_like_gibberish(text: str) -> bool:
+    """Detect obvious keyboard mash or non-command noise so we fail fast in <1 ms."""
+    stripped = text.strip()
+    if not stripped:
+        return True
+
+    letters = [ch for ch in stripped.lower() if ch.isalpha()]
+    if len(letters) < 2:
+        return True
+
+    # Single repeated character like "aaaaaa" or "zzzz"
+    if len(set(letters)) == 1 and len(letters) >= 2:
+        return True
+
+    tokens = re.findall(r"[a-zA-Z]+", stripped.lower())
+    if not tokens:
+        return True
+
+    # Don't flag URLs, paths, or known short commands
+    if "." in stripped or "\\" in stripped or "/" in stripped:
+        return False
+
+    # Single-word keyboard mash: >=6 letters with almost no vowels (e.g. "asdfghjkl", "zxcvbn")
+    # or obvious QWERTY home-row mash
+    if len(tokens) == 1:
+        tok = tokens[0]
+        if tok in {"asdf", "asdfg", "asdfgh", "asdfghj", "asdfghjk", "asdfghjkl", "qwerty", "qwert", "zxcv", "zxcvb", "zxcvbn", "hjkl", "jkl"}:
+            return True
+        vowel_count = sum(1 for c in tok if c in _VOWELS)
+        if len(tok) >= 6 and vowel_count == 0:
+            return True
+        if len(tok) >= 8 and (vowel_count / len(tok)) < 0.15:
+            return True
+
+    return False
+
+
+def normalize_typos(text: str) -> str:
+    """Conservatively fix obvious typos in command/app keywords without touching search queries."""
+    words = text.split()
+    out: List[str] = []
+    freeze_rest = False
+
+    for w in words:
+        if freeze_rest:
+            out.append(w)
+            continue
+
+        # Preserve URLs, file paths, flags, and numbers untouched
+        if any(ch in w for ch in (".", "\\", "/", ":", "@", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9")):
+            out.append(w)
+            continue
+
+        low = w.lower()
+        fixed = _TYPO_OVERRIDES.get(low)
+        if fixed is None and len(low) >= 4 and low not in _COMMAND_VOCAB:
+            # Never distort real short words or distant words (high 0.80 cutoff)
+            matches = difflib.get_close_matches(low, _COMMAND_VOCAB, n=1, cutoff=0.80)
+            if matches and matches[0][0] == low[0]:
+                fixed = matches[0]
+
+        chosen = fixed if fixed is not None else w
+        out.append(chosen)
+        if chosen.lower() in _QUERY_STOP_WORDS:
+            freeze_rest = True
+
+    return " ".join(out)
+
+
+def suggest_examples(user_text: str, limit: int = 3) -> List[str]:
+    """Return the closest valid example commands for helpful unrecognized-command feedback."""
+    cleaned = _strip_prefixes(user_text).lower()
+    if not cleaned:
+        return list(EXAMPLE_COMMANDS[:limit])
+    matches = difflib.get_close_matches(cleaned, EXAMPLE_COMMANDS, n=limit, cutoff=0.35)
+    if matches:
+        return matches
+    # Keyword overlap fallback
+    words = set(re.findall(r"[a-z]+", cleaned))
+    scored = []
+    for ex in EXAMPLE_COMMANDS:
+        overlap = len(words & set(re.findall(r"[a-z]+", ex.lower())))
+        if overlap > 0:
+            scored.append((overlap, ex))
+    scored.sort(reverse=True)
+    if scored:
+        return [ex for _, ex in scored[:limit]]
+    return [
+        "increase the brightness",
+        "go to Chrome and type Elon Musk",
+        "check system status",
+    ]
+
+
+def check_preflight(raw_text: str) -> Optional[Tuple[str, str]]:
+    """Instant (<1 ms) guard for help, undo, small talk, and obvious gibberish.
+
+    Returns `(kind, message)` where kind is one of:
+    - `"help"`
+    - `"undo"`
+    - `"small_talk"`
+    - `"invalid_input"`
+    or `None` if the input should proceed to the command cascade.
+    """
+    stripped = raw_text.strip()
+    if not stripped:
+        return ("invalid_input", "Empty instruction. Type 'help' to see available commands.")
+
+    text = _strip_prefixes(stripped)
+    if not text:
+        # Only treat as polite wake greeting if actual letters existed (e.g. "hey windows")
+        if any(ch.isalpha() for ch in stripped):
+            return (
+                "small_talk",
+                "Listening! Try saying 'increase the brightness', 'go to Chrome and type Elon Musk', or 'help'.",
+            )
+        suggestions = " | ".join(f"'{s}'" for s in suggest_examples(stripped))
+        return (
+            "invalid_input",
+            f"Unrecognized command {raw_text.strip()!r}. Try: {suggestions} (or type 'help').",
+        )
+
+    if _HELP_RE.match(text):
+        return ("help", HELP_TEXT)
+
+    if _UNDO_RE.match(text):
+        return ("undo", "")
+
+    if _SMALL_TALK_RE.match(text):
+        return (
+            "small_talk",
+            "Ready to help! Try a command like 'increase the brightness', 'go to Chrome and type Elon Musk', or type 'help'.",
+        )
+
+    if _looks_like_gibberish(text):
+        suggestions = " | ".join(f"'{s}'" for s in suggest_examples(text))
+        return (
+            "invalid_input",
+            f"Unrecognized command {raw_text.strip()!r}. Try: {suggestions} (or type 'help').",
+        )
+
+    return None
+
+
 class FastGrammarParser:
     """Zero-latency deterministic command matcher for single-step Windows & Chrome tasks."""
 
@@ -65,6 +324,16 @@ class FastGrammarParser:
         if not text:
             return None
 
+        # Conservatively repair known command/app typos first (preserves search queries & paths)
+        normalized = normalize_typos(text)
+        result = self._parse_clean(normalized)
+        if result is not None:
+            return result
+        if normalized.lower() != text.lower():
+            return self._parse_clean(text)
+        return None
+
+    def _parse_clean(self, text: str) -> Optional[List[PlannedAction]]:
         # 0. Adversarial safety catches -> explicitly route into SafetyPolicy so rule_id is logged
         if _UNSAFE_SHELL_RE.search(text):
             return [
@@ -93,11 +362,6 @@ class FastGrammarParser:
             ]
 
         # 1. Chrome search / type in Chrome (Priority #1 browser!)
-        # Examples:
-        #   "go to chrome and type elon musk"
-        #   "open chrome and search for elon musk"
-        #   "search elon musk on chrome"
-        #   "google elon musk"
         m = re.match(
             r"^(?:go\s+to|open|launch|in|on)\s+(?:google\s+)?chrome\s+(?:and\s+)?(?:type|search(?:\s+for)?|look\s+up|google|find)\s+(.+)$",
             text,
@@ -119,7 +383,6 @@ class FastGrammarParser:
                 return [PlannedAction(tool_name="chrome_search", args={"query": query})]
 
         # 2. Chrome open URL
-        # Examples: "open youtube.com in chrome", "go to chrome and open github.com", "go to github.com"
         m = re.match(
             r"^(?:(?:go\s+to|open)\s+(?:google\s+)?chrome\s+(?:and\s+)?)?(?:open|go\s+to|visit|navigate\s+to)\s+((?:https?://|file://|chrome://|javascript:)?[\w.-]+\.[a-zA-Z]{2,}(?:/[^\s]*)?|file://[^\s]+|chrome://[^\s]+|javascript:[^\s]+)(?:\s+in\s+(?:google\s+)?chrome)?$",
             text,

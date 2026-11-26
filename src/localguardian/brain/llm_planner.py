@@ -19,11 +19,11 @@ from localguardian.config import LocalGuardianConfig
 
 
 SYSTEM_PROMPT = """You are LocalGuardian, a safe local Windows desktop assistant.
-Your ONLY job is to map the user's request to one or more of the provided typed tools.
+Your ONLY job is to map clear user requests to one or more of the provided typed tools.
 Rules:
-1. Always prioritize Google Chrome tools (chrome_search, chrome_open_url) for any web/browser request.
+1. Always prioritize Google Chrome tools (chrome_search, chrome_open_url) for explicit web/browser requests.
 2. NEVER attempt to run shell commands, PowerShell, cmd, Registry edits, or touch C:\\Windows or C:\\Program Files.
-3. If the user asks something unsafe or unsupported, return no tool calls and briefly explain why.
+3. If the user's input is random words, gibberish, unclear, unsafe, or does NOT clearly ask for a desktop/browser action, DO NOT call chrome_search or any tool—reply in one short sentence explaining that it was not a recognized command.
 4. Keep tool arguments minimal, exact, and strictly matching the tool schemas.
 """
 
@@ -192,7 +192,7 @@ class LocalLLMPlanner:
         user_text: str,
         tool_schemas: List[Dict[str, Any]],
     ) -> Tuple[List[PlannedAction], str]:
-        """Ask local Ollama model for structured tool calls.
+        """Ask local Ollama model for structured tool calls with strict timeouts.
 
         Returns `(actions, assistant_reply_or_error)`.
         """
@@ -200,6 +200,7 @@ class LocalLLMPlanner:
         payload: Dict[str, Any] = {
             "model": self.config.llm.model,
             "temperature": 0.1,
+            "max_tokens": int(self.config.llm.max_tokens),
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_text},
@@ -208,8 +209,15 @@ class LocalLLMPlanner:
             "tool_choice": "auto",
         }
 
+        timeout = httpx.Timeout(
+            connect=3.0,
+            read=float(self.config.llm.timeout_seconds),
+            write=5.0,
+            pool=5.0,
+        )
+
         try:
-            with httpx.Client(timeout=self.config.llm.timeout_seconds) as client:
+            with httpx.Client(timeout=timeout) as client:
                 resp = client.post(url, json=payload)
                 resp.raise_for_status()
                 body = resp.json()
@@ -217,9 +225,16 @@ class LocalLLMPlanner:
             return (
                 [],
                 (
-                    f"Local LLM server ({self.config.llm.base_url}) is not running. "
-                    f"Start Ollama and pull '{self.config.llm.model}' for natural/multi-step commands, "
-                    "or use direct commands handled by Tier-1 fast grammar."
+                    f"Local LLM server ({self.config.llm.base_url}) is offline. "
+                    "Start Ollama for natural/multi-step commands, or type 'help' to see instant commands."
+                ),
+            )
+        except httpx.TimeoutException:
+            return (
+                [],
+                (
+                    f"Local LLM ({self.config.llm.model}) timed out after {self.config.llm.timeout_seconds:.0f}s "
+                    "without finding a clear action. Type 'help' to see supported commands."
                 ),
             )
         except Exception as exc:

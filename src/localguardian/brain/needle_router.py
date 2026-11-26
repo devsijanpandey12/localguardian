@@ -1,15 +1,18 @@
 """Tier-1.5 On-Device Cactus Needle Router (CPU, ~70-130 ms, ~131 MB RAM, 0 VRAM).
 
-Uses `cactus-compute` (`cactus.Needle`) with a compact, grounded tool subset
-and strict confidence gating (`min_confidence`, default 0.65). When Needle is
-confident, single-step casual commands run in ~100 ms on CPU without waking the
-GPU LLM; whenever confidence is low or a command is multi-step, this router
-cleanly returns None so Tier-2 Ollama (`qwen3:4b`) handles it.
+Upgrades in v0.3.0:
+- Hard per-call timeout (`config.needle.timeout_seconds`, default 5s) via a
+  dedicated worker thread so a stalled native call can NEVER freeze the CLI.
+- Optional background pre-warming (`prewarm_async()`) so interactive sessions
+  don't stall on the first unrecognized command.
+- Suppresses noisy HuggingFace Hub unauthenticated warnings cleanly.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import logging
 import os
 import threading
 import time
@@ -89,6 +92,13 @@ NEEDLE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
 ]
 
 
+def _quiet_hf_warnings() -> None:
+    os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    for name in ("huggingface_hub", "huggingface_hub.utils._http", "huggingface_hub.utils._headers"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+
 def cactus_status() -> Dict[str, Any]:
     """Check whether `cactus-compute` (Needle, Whistle, Mirage) is installed."""
     info: Dict[str, Any] = {
@@ -99,6 +109,7 @@ def cactus_status() -> Dict[str, Any]:
         "mirage": False,
     }
     try:
+        _quiet_hf_warnings()
         import cactus  # type: ignore
 
         info["installed"] = True
@@ -112,7 +123,7 @@ def cactus_status() -> Dict[str, Any]:
 
 
 class CactusNeedleRouter:
-    """Lazy, thread-safe Tier-1.5 Cactus Needle 3 tool router with confidence gating."""
+    """Lazy, thread-safe, timeout-protected Tier-1.5 Cactus Needle 3 router."""
 
     def __init__(
         self,
@@ -123,6 +134,9 @@ class CactusNeedleRouter:
         self.config = config
         self._needle_factory = needle_factory
         self._lock = threading.Lock()
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="cactus-needle"
+        )
         self._needle: Any = None
         self._init_error: Optional[str] = None
         self.last_trace: Dict[str, Any] = {}
@@ -135,6 +149,15 @@ class CactusNeedleRouter:
     def init_error(self) -> Optional[str]:
         return self._init_error
 
+    def prewarm_async(self) -> None:
+        """Warm up Cactus Needle in the background so interactive sessions don't stall."""
+        if not self.enabled or self._needle is not None:
+            return
+        try:
+            self._executor.submit(self._get_needle)
+        except Exception:
+            pass
+
     def _get_needle(self) -> Any:
         if not self.enabled:
             return None
@@ -142,6 +165,7 @@ class CactusNeedleRouter:
             if self._needle is not None or self._init_error is not None:
                 return self._needle
             try:
+                _quiet_hf_warnings()
                 if self.config.needle.disable_telemetry:
                     os.environ.setdefault("CACTUS_TELEMETRY", "0")
                 if self._needle_factory is not None:
@@ -163,47 +187,81 @@ class CactusNeedleRouter:
                 self._needle = None
             return self._needle
 
+    def _complete_sync(self, user_text: str) -> Any:
+        needle = self._get_needle()
+        if needle is None:
+            return None
+        with self._lock:
+            return needle.complete(
+                text=user_text,
+                max_new_tokens=self.config.needle.max_new_tokens,
+            )
+
     def route(self, user_text: str) -> Tuple[Optional[List[PlannedAction]], Dict[str, Any]]:
         """Attempt confident single-step tool routing via Cactus Needle 3 on CPU.
 
-        Returns `(actions_or_None, trace_dict)`. Returns `None` whenever Needle is
-        disabled, unavailable, produces no grounded calls, or falls below
-        `config.needle.min_confidence` — triggering seamless Tier-2 escalation.
+        Enforces a strict timeout (`config.needle.timeout_seconds`) and confidence
+        threshold (`config.needle.min_confidence`). Returns `(None, trace)` on any
+        timeout, error, or low confidence so the orchestrator can escalate cleanly.
         """
         if not self.enabled:
             trace = {"status": "disabled"}
             self.last_trace = trace
             return None, trace
 
-        needle = self._get_needle()
-        if needle is None:
-            trace = {"status": "unavailable", "error": self._init_error}
+        # Give extra headroom only on cold first-time init; once loaded use strict timeout
+        timeout_s = max(
+            float(self.config.needle.timeout_seconds),
+            12.0 if self._needle is None and self._needle_factory is None else 0.0,
+        )
+
+        t0 = time.perf_counter()
+        future = self._executor.submit(self._complete_sync, user_text)
+        try:
+            raw = future.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError:
+            latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+            trace = {
+                "status": "timeout",
+                "timeout_seconds": timeout_s,
+                "latency_ms": latency_ms,
+                "accepted": False,
+            }
+            self.last_trace = trace
+            return None, trace
+        except Exception as exc:
+            latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+            trace = {
+                "status": "error",
+                "error": str(exc),
+                "latency_ms": latency_ms,
+                "accepted": False,
+            }
             self.last_trace = trace
             return None, trace
 
-        t0 = time.perf_counter()
-        try:
-            with self._lock:
-                raw = needle.complete(
-                    text=user_text,
-                    max_new_tokens=self.config.needle.max_new_tokens,
-                )
-        except Exception as exc:
-            trace = {"status": "error", "error": str(exc)}
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+
+        if raw is None:
+            trace = {
+                "status": "unavailable",
+                "error": self._init_error,
+                "latency_ms": latency_ms,
+                "accepted": False,
+            }
             self.last_trace = trace
             return None, trace
-        latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
 
         if isinstance(raw, str):
             try:
                 raw = json.loads(raw)
             except json.JSONDecodeError:
-                trace = {"status": "parse_error", "latency_ms": latency_ms}
+                trace = {"status": "parse_error", "latency_ms": latency_ms, "accepted": False}
                 self.last_trace = trace
                 return None, trace
 
         if not isinstance(raw, dict):
-            trace = {"status": "invalid_response", "latency_ms": latency_ms}
+            trace = {"status": "invalid_response", "latency_ms": latency_ms, "accepted": False}
             self.last_trace = trace
             return None, trace
 
@@ -251,3 +309,9 @@ class CactusNeedleRouter:
         trace["accepted"] = True
         self.last_trace = trace
         return actions, trace
+
+    def close(self) -> None:
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
