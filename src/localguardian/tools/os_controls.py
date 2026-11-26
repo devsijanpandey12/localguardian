@@ -69,13 +69,15 @@ class OSControls:
     def set_brightness(self, level: int) -> Dict[str, Any]:
         target = _clamp(level, 0, 100)
         if sys.platform != "win32":
-            return {"level": target, "note": "Simulated on non-Windows platform."}
+            return {"before": target, "level": target, "note": "Simulated on non-Windows platform."}
         import screen_brightness_control as sbc  # type: ignore
 
+        before_levels = sbc.get_brightness()
+        before = int(before_levels[0]) if before_levels else target
         sbc.set_brightness(target)
         levels = sbc.get_brightness()
         actual = int(levels[0]) if levels else target
-        return {"level": actual, "message": f"Display brightness set to {actual}%."}
+        return {"before": before, "level": actual, "message": f"Display brightness set to {actual}%."}
 
     def adjust_brightness(self, delta: int) -> Dict[str, Any]:
         if sys.platform != "win32":
@@ -121,13 +123,14 @@ class OSControls:
     def set_volume(self, level: int) -> Dict[str, Any]:
         target = _clamp(level, 0, 100)
         if sys.platform != "win32":
-            return {"level": target}
+            return {"before": target, "level": target}
         vol = self._get_volume_interface()
+        before = round(float(vol.GetMasterVolumeLevelScalar()) * 100)
         vol.SetMasterVolumeLevelScalar(target / 100.0, None)
         if target > 0 and vol.GetMute():
             vol.SetMute(0, None)
         actual = round(float(vol.GetMasterVolumeLevelScalar()) * 100)
-        return {"level": actual, "message": f"System volume set to {actual}%."}
+        return {"before": before, "level": actual, "message": f"System volume set to {actual}%."}
 
     def adjust_volume(self, delta: int) -> Dict[str, Any]:
         current = self.get_volume()["level"]
@@ -141,13 +144,13 @@ class OSControls:
 
     def toggle_mute(self, mute: Optional[bool] = None) -> Dict[str, Any]:
         if sys.platform != "win32":
-            return {"muted": bool(mute)}
+            return {"before_muted": False, "muted": bool(mute)}
         vol = self._get_volume_interface()
         current_mute = bool(vol.GetMute())
         new_mute = (not current_mute) if mute is None else bool(mute)
         vol.SetMute(1 if new_mute else 0, None)
         state = "muted" if new_mute else "unmuted"
-        return {"muted": new_mute, "message": f"System audio {state}."}
+        return {"before_muted": current_mute, "muted": new_mute, "message": f"System audio {state}."}
 
     # ------------------------------------------------------------------
     # Media Playback Keys (Win32 VK_MEDIA_*)

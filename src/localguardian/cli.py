@@ -3,7 +3,7 @@
 Modes:
     localguardian --doctor                     Verify hardware, safety, Chrome, Cactus Needle, Ollama, voice
     localguardian --models                     Show all 3 routing tiers, Cactus Needle, Ollama VRAM, and STT
-    localguardian --text [--dry-run]           Interactive text command console
+    localguardian --text [--dry-run]           Interactive text console (with live progress, undo, help)
     localguardian --voice [--stt whisper|whistle] [--dry-run]
                                                Push-to-talk local voice console
     localguardian --once "<cmd>" [--dry-run]   Execute a single command and exit
@@ -14,6 +14,7 @@ Modes:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from typing import Optional
 
@@ -57,10 +58,37 @@ def _format_route_tag(res: OrchestratorResult) -> str:
         conf = res.needle_trace.get("confidence", 0.0)
         ms = res.needle_trace.get("latency_ms", 0.0)
         return f"tier1_5_cactus_needle | conf={conf:.2f}, {ms:.0f}ms"
-    if res.route_tier == "tier2_ollama" and res.needle_trace.get("status") == "evaluated":
-        conf = res.needle_trace.get("confidence", 0.0)
-        return f"tier2_ollama (escalated from needle conf={conf:.2f})"
+    if res.route_tier == "tier2_ollama":
+        n_status = res.needle_trace.get("status")
+        if n_status == "evaluated":
+            conf = res.needle_trace.get("confidence", 0.0)
+            return f"tier2_ollama (escalated from needle conf={conf:.2f})"
+        if n_status == "timeout":
+            return "tier2_ollama (needle timed out)"
     return res.route_tier
+
+
+class _LiveStatusLine:
+    """Single-line live progress status so the terminal never appears frozen."""
+
+    def __init__(self) -> None:
+        self._active = False
+        self._last_len = 0
+
+    def update(self, text: str) -> None:
+        line = f"  ... {text}"
+        pad = max(0, self._last_len - len(line))
+        sys.stdout.write(f"\r{line}{' ' * pad}")
+        sys.stdout.flush()
+        self._last_len = len(line)
+        self._active = True
+
+    def clear(self) -> None:
+        if self._active:
+            sys.stdout.write(f"\r{' ' * self._last_len}\r")
+            sys.stdout.flush()
+            self._active = False
+            self._last_len = 0
 
 
 def run_doctor(config: LocalGuardianConfig) -> int:
@@ -92,16 +120,15 @@ def run_doctor(config: LocalGuardianConfig) -> int:
     chrome_exe = find_chrome_executable(config)
     print(f"[{'OK  ' if chrome_exe else 'WARN'}] Chrome (#1 priority): {chrome_exe or 'Not found in standard paths'}")
 
-    # Cactus Compute check
     cinfo = cactus_status()
     if cinfo["installed"]:
         print(
             f"[OK  ] Cactus Compute v{cinfo['version']}: "
             f"Needle={cinfo['needle']}, Whistle={cinfo['whistle']}, Mirage={cinfo['mirage']} "
-            f"(enabled={config.needle.enabled}, min_conf={config.needle.min_confidence})"
+            f"(enabled={config.needle.enabled}, min_conf={config.needle.min_confidence}, timeout={config.needle.timeout_seconds}s)"
         )
     else:
-        print(f"[INFO] Cactus Compute: not installed (optional Tier-1.5; pip install cactus-compute)")
+        print("[INFO] Cactus Compute: not installed (optional Tier-1.5; pip install cactus-compute)")
 
     for mod_name, label in [
         ("screen_brightness_control", "Brightness API (screen-brightness-control)"),
@@ -121,7 +148,7 @@ def run_doctor(config: LocalGuardianConfig) -> int:
 
     planner = LocalLLMPlanner(config)
     ok, models, msg = planner.health_check()
-    print(f"[{'OK  ' if ok else 'INFO'}] Ollama LLM ({config.llm.model}): {msg}")
+    print(f"[{'OK  ' if ok else 'INFO'}] Ollama LLM ({config.llm.model}, timeout={config.llm.timeout_seconds:.0f}s): {msg}")
     if models:
         print(f"       Available Ollama models: {', '.join(models)}")
 
@@ -136,16 +163,18 @@ def run_models_info(config: LocalGuardianConfig) -> int:
 
     cinfo = cactus_status()
     needle_state = (
-        f"cactus-compute v{cinfo['version']} Needle (CPU, ~70-130 ms, min_conf={config.needle.min_confidence})"
+        f"cactus-compute v{cinfo['version']} Needle "
+        f"(CPU, ~70-130 ms, min_conf={config.needle.min_confidence}, timeout={config.needle.timeout_seconds}s)"
         if (cinfo["installed"] and cinfo["needle"] and config.needle.enabled)
         else ("DISABLED (--no-needle)" if not config.needle.enabled else "not installed")
     )
 
     print(f"LocalGuardian v{__version__} — Active 3-Tier Cascade & Runtime")
     print("=" * 64)
-    print("Tier 1   (Fast Grammar) : Pure Python deterministic regex (CPU, <1 ms)")
+    print("Pre-Flight Guard        : Instant help, undo, small talk & gibberish filter (<1 ms)")
+    print("Tier 1   (Fast Grammar) : Pure Python regex + conservative typo fix (CPU, <1 ms)")
     print(f"Tier 1.5 (Edge Router)  : {needle_state}")
-    print(f"Tier 2   (Local LLM)    : {config.llm.provider} -> {config.llm.model} ({config.llm.base_url})")
+    print(f"Tier 2   (Local LLM)    : {config.llm.provider} -> {config.llm.model} (timeout={config.llm.timeout_seconds:.0f}s, max_tokens={config.llm.max_tokens})")
     print(
         f"Voice STT               : {config.voice.stt_backend} "
         f"(model={config.voice.stt_model}, device={config.voice.stt_device}, compute={config.voice.stt_compute_type})"
@@ -195,27 +224,65 @@ def run_text_repl(config: LocalGuardianConfig, *, dry_run: bool = False) -> int:
         confirm_channel=ConfirmationChannel.CLI,
         oneshot=False,
     )
-    mode_tag = " [DRY-RUN]" if dry_run else ""
+    # Pre-warm Cactus Needle in background so first escalated command never stalls
+    orchestrator.prewarm()
+
+    active_dry_run = dry_run
+    status_line = _LiveStatusLine()
+    mode_tag = " [DRY-RUN]" if active_dry_run else ""
     needle_tag = "Cactus Needle 3" if config.needle.enabled else "off"
     print(f"LocalGuardian v{__version__} — Interactive Text Mode{mode_tag}")
-    print(f"Cascade: Fast Grammar -> {needle_tag} (CPU) -> {config.llm.provider}/{config.llm.model} (GPU)")
-    print("Try: 'Windows, increase the brightness' | 'put chrome on the left' | 'pause music' | 'delete C:\\Windows'")
-    print("Type 'exit' or 'quit' to stop.\n")
+    print(f"Cascade: Pre-Flight -> Fast Grammar -> {needle_tag} (CPU) -> {config.llm.provider}/{config.llm.model} (GPU)")
+    print("Type 'help' for commands, 'undo' to revert brightness/volume, 'models'/'audit', or 'exit' to quit.\n")
 
     try:
         while True:
+            prompt = "localguardian [dry]> " if active_dry_run else "localguardian> "
             try:
-                cmd = input("localguardian> ").strip()
+                cmd = input(prompt).strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
             if not cmd:
                 continue
-            if cmd.lower() in {"exit", "quit", "q"}:
+            low = cmd.lower()
+            if low in {"exit", "quit", "q"}:
                 break
-            res = orchestrator.handle(cmd, dry_run=dry_run)
+            if low == "clear":
+                os.system("cls" if sys.platform == "win32" else "clear")
+                continue
+            if low == "models":
+                run_models_info(config)
+                print()
+                continue
+            if low == "doctor":
+                run_doctor(config)
+                print()
+                continue
+            if low == "audit":
+                run_audit_view(config, limit=10)
+                print()
+                continue
+            if low in {"dry-run on", "dryrun on"}:
+                active_dry_run = True
+                print("  [session] Dry-run enabled (simulating actions).\n")
+                continue
+            if low in {"dry-run off", "dryrun off"}:
+                active_dry_run = False
+                print("  [session] Dry-run disabled (live execution active).\n")
+                continue
+
+            try:
+                res = orchestrator.handle(
+                    cmd,
+                    dry_run=active_dry_run,
+                    on_status=status_line.update,
+                )
+            finally:
+                status_line.clear()
             print(f"  [{_format_route_tag(res)}] {res.message}\n")
     finally:
+        orchestrator.close()
         registry.close()
     return 0
 
@@ -230,8 +297,11 @@ def run_voice_repl(config: LocalGuardianConfig, *, dry_run: bool = False) -> int
         confirm_channel=ConfirmationChannel.DIALOG,
         oneshot=False,
     )
+    orchestrator.prewarm()
+
     listener = PushToTalkListener(config)
     stt = LocalTranscriber(config)
+    status_line = _LiveStatusLine()
     mode_tag = " [DRY-RUN]" if dry_run else ""
     print(
         f"LocalGuardian v{__version__} — Local Voice Mode "
@@ -253,15 +323,26 @@ def run_voice_repl(config: LocalGuardianConfig, *, dry_run: bool = False) -> int
             if audio is None:
                 print("  No audio captured.\n")
                 continue
-            print(f"  Transcribing locally via {config.voice.stt_backend}...")
-            transcript = stt.transcribe_array(audio)
+            status_line.update(f"transcribing locally via {config.voice.stt_backend}...")
+            try:
+                transcript = stt.transcribe_array(audio)
+            finally:
+                status_line.clear()
             print(f"  Heard: {transcript!r}")
             if not transcript:
                 print("  Nothing understood.\n")
                 continue
-            res = orchestrator.handle(transcript, dry_run=dry_run)
+            try:
+                res = orchestrator.handle(
+                    transcript,
+                    dry_run=dry_run,
+                    on_status=status_line.update,
+                )
+            finally:
+                status_line.clear()
             print(f"  [{_format_route_tag(res)}] {res.message}\n")
     finally:
+        orchestrator.close()
         registry.close()
     return 0
 
@@ -335,11 +416,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             confirm_channel=ConfirmationChannel.CLI,
             oneshot=True,
         )
+        status_line = _LiveStatusLine()
         try:
-            res = orchestrator.handle(args.once, dry_run=args.dry_run)
+            res = orchestrator.handle(
+                args.once,
+                dry_run=args.dry_run,
+                on_status=status_line.update if sys.stdout.isatty() else None,
+            )
+            status_line.clear()
             print(f"[{_format_route_tag(res)}] {res.message}")
             return 0
         finally:
+            orchestrator.close()
             registry.close()
     if args.voice:
         return run_voice_repl(config, dry_run=args.dry_run)

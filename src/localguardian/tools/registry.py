@@ -131,6 +131,7 @@ class ToolRegistry:
         self.windows = windows or WindowController()
         self.keep_browser_open_on_oneshot = keep_browser_open_on_oneshot
         self._specs: Dict[str, ToolSpec] = {}
+        self._undo_stack: List[tuple[str, Dict[str, Any], str]] = []
         self._register_builtin_tools()
 
     def _register_builtin_tools(self) -> None:
@@ -456,6 +457,8 @@ class ToolRegistry:
         try:
             data = spec.handler(validated)
             msg = str(data.get("message", f"Executed {tool_name} successfully."))
+            if route_tier != "undo":
+                self._record_undo(tool_name, data)
             self.audit.record(
                 transcript=transcript,
                 route_tier=route_tier,
@@ -501,6 +504,41 @@ class ToolRegistry:
                 status="error",
                 message=msg,
             )
+
+    def _record_undo(self, tool_name: str, data: Dict[str, Any]) -> None:
+        """Save inverse operation for reversible OS actions (brightness, volume, mute)."""
+        if tool_name in {"set_brightness", "adjust_brightness"} and isinstance(data.get("before"), int):
+            self._undo_stack.append(
+                ("set_brightness", {"level": int(data["before"])}, f"restored brightness to {data['before']}%")
+            )
+        elif tool_name in {"set_volume", "adjust_volume"} and isinstance(data.get("before"), int):
+            self._undo_stack.append(
+                ("set_volume", {"level": int(data["before"])}, f"restored volume to {data['before']}%")
+            )
+        elif tool_name == "toggle_mute" and isinstance(data.get("before_muted"), bool):
+            state = "muted" if data["before_muted"] else "unmuted"
+            self._undo_stack.append(
+                ("toggle_mute", {"mute": bool(data["before_muted"])}, f"restored audio to {state}")
+            )
+        # Cap undo stack to last 20 actions
+        if len(self._undo_stack) > 20:
+            self._undo_stack = self._undo_stack[-20:]
+
+    def undo_last(self, *, transcript: str = "undo", dry_run: Optional[bool] = None) -> Optional[ToolExecutionResult]:
+        """Revert the most recent reversible OS action via the full safety-gated pipeline."""
+        if not self._undo_stack:
+            return None
+        undo_tool, undo_args, label = self._undo_stack.pop()
+        res = self.invoke(
+            undo_tool,
+            undo_args,
+            transcript=transcript,
+            route_tier="undo",
+            dry_run=dry_run,
+        )
+        if res.status == "ok":
+            res.message = f"Undo successful ({label})."
+        return res
 
     def close(self) -> None:
         self.chrome.close()
