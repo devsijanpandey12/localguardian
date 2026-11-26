@@ -1,6 +1,21 @@
-# LocalGuardian Prototype (v0.2.0) — What Was Built & Why Each Choice Was Made
+# LocalGuardian Prototype (v0.3.0) — What Was Built & Why Each Choice Was Made
 
-> **Scope:** Unlike [RESEARCH.md](./RESEARCH.md) (broader SOTA landscape & roadmap), this document records **strictly what is implemented and verified right now in v0.2.0**, the exact libraries and local models used, and the engineering rationale behind every choice.
+> **Scope:** Unlike [RESEARCH.md](./RESEARCH.md) (broader SOTA landscape & roadmap), this document records **strictly what is implemented and verified right now in v0.3.0**, the exact libraries and local models used, and the engineering rationale behind every choice.
+
+---
+
+## 0. Key Freeze Fixes & Usability Upgrades (`v0.3.0`)
+
+Real-world testing revealed that unrecognized/wrong commands previously appeared to "freeze" for 10–30+ seconds because:
+1. Cactus Needle initialized lazily on the first miss (printing an HF Hub warning) with no timeout wrapper.
+2. Obvious gibberish/greetings escalated all the way to Ollama `qwen3:4b` with a 90s timeout and unbounded token generation while printing zero status feedback.
+
+**Fixed cleanly in `v0.3.0`:**
+- **Pre-Flight Guard (`fast_grammar.py`):** Instantly handles `help`, `undo`, small talk, and obvious gibberish (`asdfghjkl`, `qwerty`, etc.) in **<1 ms** with `"Try: ..."` command suggestions.
+- **Conservative Typo Recovery (`fast_grammar.py`):** Auto-recovers common command/app typos (`open chorme`, `incrase brigtness`, `volum down`) in **<1 ms** without altering search queries.
+- **Timeout-Protected & Pre-Warmed Cactus Needle (`needle_router.py`):** Dedicated worker thread enforces a hard `5s` timeout (`config.needle.timeout_seconds`), suppresses noisy HF Hub logs, and pre-warms asynchronously when `--text`/`--voice` starts.
+- **Bounded Ollama Calls + Live Progress (`llm_planner.py`, `cli.py`):** Split `3s` connect / `25s` read timeout, `max_tokens: 768`, and a clean live status line (`... checking Cactus Needle` → `... asking local qwen3:4b`) so the terminal never appears hung.
+- **Reversible Undo & REPL Shortcuts (`registry.py`, `cli.py`):** Saying/typing `undo` restores the exact prior brightness, volume, or mute state; `--text` also supports `help`, `models`, `doctor`, `audit`, `dry-run on/off`, and `clear`.
 
 ---
 
